@@ -1,0 +1,16 @@
+# Built RPMs
+*.rpm
+
+# Generated on first build - contains local config, not meant for version control
+versions.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+
+# Editor
+.vscode/
+*.swp
+*~

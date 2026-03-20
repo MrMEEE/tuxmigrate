@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: tuxmigrate
+  author: tuxmigrate
+  description: >
+    Applies versioned configuration changes to the local machine.
+    Managed by tuxmigrate - do not edit manually.
+  license: MIT
+  min_ansible_version: "2.14"
+
+dependencies: []
