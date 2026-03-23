@@ -7,26 +7,39 @@ and an RPM is produced. Installing the RPM runs all unapplied changes on the hos
 """
 
 import argparse
+import base64
 import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
+import tarfile
+import tempfile
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSIONS_FILE = "versions.json"
+CONFIG_FILE = "config.json"
+LEGACY_VERSIONS_FILE = "versions.json"
 CHANGES_DIR = "changes"
 ROLE_DIR = "role"
 ROLE_PLAYBOOKS_DIR = os.path.join(ROLE_DIR, "playbooks")
 ROLE_TASKS_DIR = os.path.join(ROLE_DIR, "tasks")
 SITE_YML = "site.yml"
-POST_INSTALL_SCRIPT = "post-install.sh"
 FACTS_DIR = "/etc/ansible/facts.d"
+DEFAULT_PACKAGE_NAME = "tuxmigrate"
+DEFAULT_MAINTAINER = "tuxmigrate"
+DEFAULT_DESCRIPTION = "TuxMigrate configuration management"
+VALID_BUILDERS = {"fpm", "rpmbuild"}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,18 +59,122 @@ def prompt_field(label: str, cli_value: str | None, default: str) -> str:
     return answer if answer else default
 
 
-def load_versions() -> dict | None:
-    """Load versions.json. Returns None if the file does not exist yet."""
-    if not Path(VERSIONS_FILE).exists():
+def coerce_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def default_config() -> dict:
+    return {
+        "version": "1.0.0",
+        "package_name": DEFAULT_PACKAGE_NAME,
+        "maintainer": DEFAULT_MAINTAINER,
+        "description": DEFAULT_DESCRIPTION,
+        "builder": "fpm",
+        "playbooks": [],
+        "satellite": {
+            "auto_push": False,
+            "servername": "",
+            "username": "",
+            "password": "",
+            "verifyssl": True,
+            "repository_id": "",
+        },
+    }
+
+
+def normalize_config(data: dict) -> dict:
+    normalized = default_config()
+    normalized.update(data)
+
+    builder = str(normalized.get("builder", "fpm")).strip().lower()
+    normalized["builder"] = builder if builder in VALID_BUILDERS else "fpm"
+
+    playbooks = normalized.get("playbooks")
+    normalized["playbooks"] = playbooks if isinstance(playbooks, list) else []
+
+    satellite = normalized.get("satellite")
+    if not isinstance(satellite, dict):
+        satellite = {}
+
+    normalized["satellite"] = {
+        "auto_push": coerce_bool(satellite.get("auto_push"), False),
+        "servername": str(satellite.get("servername", "")).strip(),
+        "username": str(satellite.get("username", "")).strip(),
+        "password": str(satellite.get("password", "")),
+        "verifyssl": coerce_bool(satellite.get("verifyssl"), True),
+        "repository_id": str(satellite.get("repository_id", "")).strip(),
+    }
+
+    return normalized
+
+
+def load_config() -> dict | None:
+    """Load config.json, automatically migrating legacy versions.json."""
+    config_path = Path(CONFIG_FILE)
+    legacy_path = Path(LEGACY_VERSIONS_FILE)
+
+    source_path: Path | None = None
+    if config_path.exists():
+        source_path = config_path
+    elif legacy_path.exists():
+        source_path = legacy_path
+
+    if source_path is None:
         return None
-    with open(VERSIONS_FILE) as fh:
-        return json.load(fh)
+
+    with open(source_path) as fh:
+        data = normalize_config(json.load(fh))
+
+    if source_path == legacy_path and not config_path.exists():
+        save_config(data)
+        legacy_path.unlink()
+        print(f"Migrated {LEGACY_VERSIONS_FILE} -> {CONFIG_FILE}")
+
+    return data
 
 
-def save_versions(data: dict) -> None:
-    with open(VERSIONS_FILE, "w") as fh:
+def save_config(data: dict) -> None:
+    with open(CONFIG_FILE, "w") as fh:
         json.dump(data, fh, indent=2)
         fh.write("\n")
+
+
+def redact_config(data: dict, show_secrets: bool = False) -> dict:
+    rendered = json.loads(json.dumps(data))
+    satellite = rendered.get("satellite")
+    if isinstance(satellite, dict) and not show_secrets and satellite.get("password"):
+        satellite["password"] = "********"
+    return rendered
+
+
+def config_change_requested(args: argparse.Namespace) -> bool:
+    return any(
+        value is not None
+        for value in [
+            args.package_name,
+            args.maintainer,
+            args.description,
+            args.builder,
+            args.satellite_servername,
+            args.satellite_username,
+            args.satellite_password,
+            args.satellite_repository_id,
+            args.satellite_verifyssl,
+            args.satellite_auto_push,
+        ]
+    )
 
 
 def increment_version(version: str, bump: str = "minor") -> str:
@@ -99,6 +216,346 @@ def fact_name(playbook_filename: str) -> str:
 def register_var(playbook_filename: str) -> str:
     """Return a unique Ansible register variable name for a playbook."""
     return f"_tm_fact_{sanitize(Path(playbook_filename).stem)}"
+
+
+def render_site_yml(package_name: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        ---
+        # Applied to localhost by the RPM post-install script.
+        # Managed by tuxmigrate - do not edit manually.
+        - name: Apply tuxmigrate configuration changes
+          hosts: localhost
+          connection: local
+          become: true
+          gather_facts: true
+
+          roles:
+            - role: {_rpm_role_path(package_name)}
+        """
+    )
+
+
+def render_post_install_body(package_name: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        set -eu
+
+        SITE_YML="{_rpm_site_yml_path(package_name)}"
+
+        echo "[tuxmigrate] Running configuration changes..."
+
+        if ! command -v ansible-playbook >/dev/null 2>&1; then
+            echo "[tuxmigrate] ERROR: ansible-playbook not found. Install Ansible and re-run:"
+            echo "  ansible-playbook ${{SITE_YML}} -c local"
+            exit 1
+        fi
+
+        ansible-playbook "${{SITE_YML}}" --connection=local
+
+        echo "[tuxmigrate] Done."
+        """
+    )
+
+
+def render_post_install_script(package_name: str) -> str:
+    return "#!/bin/sh\n" + render_post_install_body(package_name)
+
+
+def normalize_server_url(servername: str) -> str:
+    server = servername.strip()
+    if not server:
+        return ""
+    if "://" not in server:
+        server = f"https://{server}"
+    return server.rstrip("/")
+
+
+def build_multipart_form_data(
+    fields: dict[str, str],
+    files: list[tuple[str, str, bytes, str]],
+) -> tuple[str, bytes]:
+    boundary = f"----tuxmigrate-{uuid.uuid4().hex}"
+    body = bytearray()
+
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        body.extend(str(value).encode())
+        body.extend(b"\r\n")
+
+    for field_name, filename, content, content_type in files:
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{field_name}"; '
+                f'filename="{filename}"\r\n'
+            ).encode()
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
+        body.extend(content)
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode())
+    return f"multipart/form-data; boundary={boundary}", bytes(body)
+
+
+def make_api_request(
+    servername: str,
+    username: str,
+    password: str,
+    verifyssl: bool,
+    method: str,
+    path: str,
+    *,
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> object:
+    base_url = normalize_server_url(servername)
+    if not base_url:
+        die("Satellite/Katello servername is not configured.")
+
+    url = urllib.parse.urljoin(f"{base_url}/", path.lstrip("/"))
+    request_headers = {
+        "Accept": "application/json",
+        "Authorization": "Basic "
+        + base64.b64encode(f"{username}:{password}".encode()).decode(),
+    }
+    if headers:
+        request_headers.update(headers)
+
+    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    context = ssl.create_default_context()
+    if not verifyssl:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    try:
+        with urllib.request.urlopen(request, context=context) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict):
+                detail = (
+                    parsed.get("displayMessage")
+                    or parsed.get("error")
+                    or "; ".join(parsed.get("errors", []))
+                    or detail
+                )
+        except json.JSONDecodeError:
+            pass
+        die(f"Satellite/Katello API request failed ({exc.code} {exc.reason}): {detail}")
+    except urllib.error.URLError as exc:
+        die(f"Could not reach Satellite/Katello server '{base_url}': {exc.reason}")
+
+    if not payload:
+        return None
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return payload.decode(errors="replace")
+
+
+def push_rpm_to_satellite(rpm_path: Path, satellite: dict) -> None:
+    required_fields = {
+        "servername": "satellite.servername",
+        "username": "satellite.username",
+        "password": "satellite.password",
+        "repository_id": "satellite.repository_id",
+    }
+
+    missing = [label for key, label in required_fields.items() if not satellite.get(key)]
+    if missing:
+        die(
+            "Satellite/Katello upload requested, but the following config values are missing: "
+            + ", ".join(missing)
+        )
+
+    print(
+        "\nUploading RPM to Satellite/Katello "
+        f"repository {satellite['repository_id']} on {normalize_server_url(satellite['servername'])}..."
+    )
+
+    with rpm_path.open("rb") as fh:
+        content_type, payload = build_multipart_form_data(
+            {"content_type": "rpm"},
+            [("content", rpm_path.name, fh.read(), "application/x-rpm")],
+        )
+
+    response = make_api_request(
+        satellite["servername"],
+        satellite["username"],
+        satellite["password"],
+        satellite["verifyssl"],
+        "POST",
+        f"/katello/api/repositories/{satellite['repository_id']}/upload_content",
+        data=payload,
+        headers={"Content-Type": content_type},
+    )
+
+    if isinstance(response, dict) and response.get("status") == "success":
+        filenames = response.get("filenames") or [rpm_path.name]
+        print(f"Satellite/Katello upload complete: {', '.join(filenames)}")
+        return
+
+    if isinstance(response, dict):
+        detail = (
+            response.get("displayMessage")
+            or response.get("error")
+            or "; ".join(response.get("errors", []))
+            or json.dumps(response)
+        )
+        die(f"Satellite/Katello upload failed: {detail}")
+
+    print("Satellite/Katello upload complete.")
+
+
+def find_latest_rpm(search_root: Path, package_name: str, version: str) -> Path:
+    candidates = sorted(
+        search_root.glob(f"**/{package_name}-{version}-*.rpm"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        die(f"RPM build finished, but no RPM matching {package_name}-{version}-*.rpm was found.")
+    return candidates[0]
+
+
+def run_build_command(command: list[str], tool_name: str) -> None:
+    print(f"\nRunning: {' '.join(command)}\n")
+    try:
+        result = subprocess.run(command)
+    except FileNotFoundError:
+        die(f"{tool_name} is not installed or not available in PATH.")
+
+    if result.returncode != 0:
+        die(f"{tool_name} failed. Check the output above for details.")
+
+
+def build_with_fpm(
+    package_name: str,
+    version: str,
+    maintainer: str,
+    description: str,
+) -> Path:
+    with tempfile.TemporaryDirectory(prefix="tuxmigrate-fpm-") as temp_dir:
+        temp_path = Path(temp_dir)
+        site_file = temp_path / "site.yml"
+        post_install_file = temp_path / "post-install.sh"
+
+        site_file.write_text(render_site_yml(package_name))
+        post_install_file.write_text(render_post_install_script(package_name))
+        post_install_file.chmod(0o755)
+
+        fpm_cmd = [
+            "fpm",
+            "-s",
+            "dir",
+            "-t",
+            "rpm",
+            "-n",
+            package_name,
+            "-v",
+            version,
+            "--after-install",
+            str(post_install_file),
+            "--maintainer",
+            maintainer,
+            "--description",
+            description,
+            "--rpm-summary",
+            description,
+            "--force",
+            f"{ROLE_DIR}/={_rpm_role_path(package_name)}/",
+            f"{site_file}={_rpm_site_yml_path(package_name)}",
+        ]
+
+        run_build_command(fpm_cmd, "fpm")
+
+    return find_latest_rpm(Path.cwd(), package_name, version)
+
+
+def build_rpmbuild_spec(
+    package_name: str,
+    version: str,
+    description: str,
+) -> str:
+    summary = description.splitlines()[0].strip() if description.strip() else DEFAULT_DESCRIPTION
+    post_install = render_post_install_body(package_name).rstrip()
+    return textwrap.dedent(
+        f"""\
+        Name:           {package_name}
+        Version:        {version}
+        Release:        1%{{?dist}}
+        Summary:        {summary}
+        License:        GPLv3
+        BuildArch:      noarch
+        Source0:        %{{name}}-%{{version}}.tar.gz
+
+        %description
+        {description}
+
+        %prep
+        %setup -q
+
+        %build
+
+        %install
+        rm -rf %{{buildroot}}
+        mkdir -p %{{buildroot}}/usr/share/%{{name}}
+        cp -a role %{{buildroot}}{_rpm_role_path(package_name)}
+        install -m 0644 site.yml %{{buildroot}}{_rpm_site_yml_path(package_name)}
+
+        %files
+        {_rpm_role_path(package_name)}
+        {_rpm_site_yml_path(package_name)}
+
+        %post
+        {post_install.replace(chr(10), chr(10) + '        ')}
+        """
+    )
+
+
+def build_with_rpmbuild(
+    package_name: str,
+    version: str,
+    description: str,
+) -> Path:
+    with tempfile.TemporaryDirectory(prefix="tuxmigrate-rpmbuild-") as temp_dir:
+        topdir = Path(temp_dir) / "rpmbuild"
+        for dirname in ["BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"]:
+            (topdir / dirname).mkdir(parents=True, exist_ok=True)
+
+        source_root = Path(temp_dir) / f"{package_name}-{version}"
+        shutil.copytree(ROLE_DIR, source_root / ROLE_DIR)
+        (source_root / SITE_YML).write_text(render_site_yml(package_name))
+
+        tarball = topdir / "SOURCES" / f"{package_name}-{version}.tar.gz"
+        with tarfile.open(tarball, "w:gz") as archive:
+            archive.add(source_root, arcname=source_root.name)
+
+        spec_file = topdir / "SPECS" / f"{package_name}.spec"
+        spec_file.write_text(build_rpmbuild_spec(package_name, version, description))
+
+        rpmbuild_cmd = [
+            "rpmbuild",
+            "--define",
+            f"_topdir {topdir}",
+            "-bb",
+            str(spec_file),
+        ]
+        run_build_command(rpmbuild_cmd, "rpmbuild")
+
+        built_rpm = find_latest_rpm(topdir / "RPMS", package_name, version)
+        final_rpm = Path.cwd() / built_rpm.name
+        shutil.copy2(built_rpm, final_rpm)
+
+    return final_rpm
 
 
 # ---------------------------------------------------------------------------
@@ -178,22 +635,16 @@ def cmd_build(args: argparse.Namespace) -> None:
         print(f"  {p.name}")
 
     # 2. Load state (bootstrap on first run)
-    data = load_versions()
+    data = load_config()
     if data is None:
-        print(f"{VERSIONS_FILE} not found — initialising new project.")
+        print(f"{CONFIG_FILE} not found — initialising new project.")
         print("Press Enter to accept the [default] or type a new value.\n")
-        package_name = prompt_field("Package name", args.package_name, "tuxmigrate")
-        maintainer   = prompt_field("Maintainer",   args.maintainer,   "tuxmigrate")
-        description  = prompt_field("Description",  args.description,  "TuxMigrate configuration management")
-        data = {
-            "version": "1.0.0",
-            "package_name": package_name,
-            "maintainer": maintainer,
-            "description": description,
-            "playbooks": [],
-        }
-        save_versions(data)
-        print(f"\nCreated {VERSIONS_FILE} (version 1.0.0)\n")
+        data = default_config()
+        data["package_name"] = prompt_field("Package name", args.package_name, DEFAULT_PACKAGE_NAME)
+        data["maintainer"] = prompt_field("Maintainer", args.maintainer, DEFAULT_MAINTAINER)
+        data["description"] = prompt_field("Description", args.description, DEFAULT_DESCRIPTION)
+        save_config(data)
+        print(f"\nCreated {CONFIG_FILE} (version 1.0.0)\n")
 
     old_version = data["version"]
     new_version = increment_version(old_version, args.bump)
@@ -211,10 +662,10 @@ def cmd_build(args: argparse.Namespace) -> None:
         new_entries.append(dest_name)
         print(f"  Moved: {src.name} -> role/playbooks/{dest_name}")
 
-    # 4. Update versions.json
+    # 4. Update config
     data["version"] = new_version
     data.setdefault("playbooks", []).extend(new_entries)
-    save_versions(data)
+    save_config(data)
 
     # 5. Regenerate role/tasks/main.yml
     tasks_path = Path(ROLE_TASKS_DIR)
@@ -224,56 +675,64 @@ def cmd_build(args: argparse.Namespace) -> None:
     tasks_file.write_text(tasks_content)
     print(f"\nRegenerated {tasks_file}")
 
-    # 6. Build the RPM with fpm
-    package_name = args.package_name or data.get("package_name", "tuxmigrate")
-    maintainer = args.maintainer or data.get("maintainer", "tuxmigrate")
+    # 6. Build the RPM
+    package_name = args.package_name or data.get("package_name", DEFAULT_PACKAGE_NAME)
+    maintainer = args.maintainer or data.get("maintainer", DEFAULT_MAINTAINER)
     description = args.description or data.get(
-        "description", "TuxMigrate configuration management"
+        "description", DEFAULT_DESCRIPTION
     )
+    builder = (args.builder or data.get("builder") or "fpm").strip().lower()
+    if builder not in VALID_BUILDERS:
+        die(f"Unknown builder '{builder}'. Use one of: {', '.join(sorted(VALID_BUILDERS))}.")
 
     # Persist build metadata for future builds
     data["package_name"] = package_name
     data["maintainer"] = maintainer
     data["description"] = description
-    save_versions(data)
+    data["builder"] = builder
+    save_config(data)
 
-    fpm_cmd = [
-        "fpm",
-        "-s", "dir",
-        "-t", "rpm",
-        "-n", package_name,
-        "-v", new_version,
-        "--after-install", POST_INSTALL_SCRIPT,
-        "--maintainer", maintainer,
-        "--description", description,
-        "--rpm-summary", description,
-        "--force",
-        # Map local paths to install destinations
-        f"{ROLE_DIR}/={_rpm_role_path(package_name)}/",
-        f"{SITE_YML}={_rpm_site_yml_path(package_name)}",
-    ]
+    if builder == "fpm":
+        rpm_path = build_with_fpm(package_name, new_version, maintainer, description)
+    else:
+        rpm_path = build_with_rpmbuild(package_name, new_version, description)
 
-    print(f"\nRunning: {' '.join(fpm_cmd)}\n")
-    result = subprocess.run(fpm_cmd)
-    if result.returncode != 0:
-        die("fpm failed. Check the output above for details.")
+    push_requested = data.get("satellite", {}).get("auto_push", False)
+    if args.push is not None:
+        push_requested = args.push
 
-    rpm_file = f"{package_name}-{new_version}-1.x86_64.rpm"
-    print(f"\nBuild complete: {rpm_file}")
+    print(f"\nBuild complete: {rpm_path.name}")
     print(
-        f"Install with:  sudo rpm -Uvh {rpm_file}\n"
-        f"               or: sudo dnf install ./{rpm_file}"
+        f"Install with:  sudo rpm -Uvh {rpm_path.name}\n"
+        f"               or: sudo dnf install ./{rpm_path.name}"
     )
+
+    if push_requested:
+        push_rpm_to_satellite(rpm_path, data.get("satellite", {}))
 
 
 def cmd_status(args: argparse.Namespace) -> None:
     """Show current version and registered playbooks."""
-    data = load_versions()
+    data = load_config()
     if data is None:
-        print(f"{VERSIONS_FILE} not found. Run 'tuxmigrate build' to initialise the project.")
+        print(f"{CONFIG_FILE} not found. Run 'tuxmigrate build' to initialise the project.")
         return
     print(f"Package : {data.get('package_name', 'tuxmigrate')}")
     print(f"Version : {data['version']}")
+    print(f"Builder : {data.get('builder', 'fpm')}")
+
+    satellite = data.get("satellite", {})
+    if satellite.get("servername") or satellite.get("repository_id"):
+        print(
+            "Satellite: "
+            f"server={satellite.get('servername') or '(unset)'} "
+            f"repository_id={satellite.get('repository_id') or '(unset)'} "
+            f"auto_push={coerce_bool(satellite.get('auto_push'), False)} "
+            f"verifyssl={coerce_bool(satellite.get('verifyssl'), True)}"
+        )
+    else:
+        print("Satellite: not configured")
+
     playbooks = data.get("playbooks", [])
     if not playbooks:
         print("Playbooks: (none yet)")
@@ -294,6 +753,64 @@ def cmd_status(args: argparse.Namespace) -> None:
             print(f"  {name}")
     else:
         print("\nNo pending changes.")
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    """Initialize, view, or update config.json values."""
+    data = load_config()
+    changed = False
+    requested_change = config_change_requested(args)
+
+    if data is None:
+        if args.init or requested_change:
+            data = default_config()
+            changed = True
+            print(f"Initialised {CONFIG_FILE} with defaults.")
+        else:
+            print(f"{CONFIG_FILE} not found. Run 'tuxmigrate config --init' to create it.")
+            return
+
+    if args.package_name is not None:
+        data["package_name"] = args.package_name
+        changed = True
+    if args.maintainer is not None:
+        data["maintainer"] = args.maintainer
+        changed = True
+    if args.description is not None:
+        data["description"] = args.description
+        changed = True
+    if args.builder is not None:
+        data["builder"] = args.builder
+        changed = True
+
+    satellite = data.setdefault("satellite", default_config()["satellite"])
+    if args.satellite_servername is not None:
+        satellite["servername"] = args.satellite_servername.strip()
+        changed = True
+    if args.satellite_username is not None:
+        satellite["username"] = args.satellite_username.strip()
+        changed = True
+    if args.satellite_password is not None:
+        satellite["password"] = args.satellite_password
+        changed = True
+    if args.satellite_repository_id is not None:
+        satellite["repository_id"] = args.satellite_repository_id.strip()
+        changed = True
+    if args.satellite_verifyssl is not None:
+        satellite["verifyssl"] = args.satellite_verifyssl
+        changed = True
+    if args.satellite_auto_push is not None:
+        satellite["auto_push"] = args.satellite_auto_push
+        changed = True
+
+    data = normalize_config(data)
+    if changed:
+        save_config(data)
+        print(f"Saved {CONFIG_FILE}.")
+
+    if args.show or (not requested_change and not args.init):
+        rendered = redact_config(data, show_secrets=args.show_secrets)
+        print(json.dumps(rendered, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +846,7 @@ def main() -> None:
     build_p.add_argument(
         "--package-name",
         metavar="NAME",
-        help="RPM package name (default: value from versions.json or 'tuxmigrate').",
+        help="RPM package name (default: value from config.json or 'tuxmigrate').",
     )
     build_p.add_argument(
         "--maintainer",
@@ -340,6 +857,25 @@ def main() -> None:
         "--description",
         metavar="TEXT",
         help="RPM description / summary.",
+    )
+    build_p.add_argument(
+        "--builder",
+        choices=sorted(VALID_BUILDERS),
+        help="RPM build backend to use (default: value from config.json or fpm).",
+    )
+    push_group = build_p.add_mutually_exclusive_group()
+    push_group.add_argument(
+        "--push",
+        dest="push",
+        action="store_true",
+        default=None,
+        help="Upload the built RPM to Satellite/Katello after a successful build.",
+    )
+    push_group.add_argument(
+        "--no-push",
+        dest="push",
+        action="store_false",
+        help="Do not upload the built RPM to Satellite/Katello for this build.",
     )
     bump_group = build_p.add_mutually_exclusive_group()
     bump_group.add_argument(
@@ -371,6 +907,96 @@ def main() -> None:
         help="Show current version and pending changes.",
     )
     status_p.set_defaults(func=cmd_status)
+
+    # config
+    config_p = sub.add_parser(
+        "config",
+        help="Initialize, show, or update config.json values.",
+    )
+    config_p.add_argument(
+        "--init",
+        action="store_true",
+        help="Create config.json with defaults if it does not exist.",
+    )
+    config_p.add_argument(
+        "--show",
+        action="store_true",
+        help="Print current config.json values (password is redacted by default).",
+    )
+    config_p.add_argument(
+        "--show-secrets",
+        action="store_true",
+        help="When used with --show, print secret values such as satellite.password.",
+    )
+    config_p.add_argument(
+        "--package-name",
+        metavar="NAME",
+        help="Set package_name in config.json.",
+    )
+    config_p.add_argument(
+        "--maintainer",
+        metavar="EMAIL",
+        help="Set maintainer in config.json.",
+    )
+    config_p.add_argument(
+        "--description",
+        metavar="TEXT",
+        help="Set description in config.json.",
+    )
+    config_p.add_argument(
+        "--builder",
+        choices=sorted(VALID_BUILDERS),
+        help="Set default build backend in config.json.",
+    )
+    config_p.add_argument(
+        "--satellite-servername",
+        metavar="URL_OR_HOST",
+        help="Set satellite.servername in config.json.",
+    )
+    config_p.add_argument(
+        "--satellite-username",
+        metavar="USER",
+        help="Set satellite.username in config.json.",
+    )
+    config_p.add_argument(
+        "--satellite-password",
+        metavar="PASS",
+        help="Set satellite.password in config.json.",
+    )
+    config_p.add_argument(
+        "--satellite-repository-id",
+        metavar="ID",
+        help="Set satellite.repository_id in config.json.",
+    )
+    satellite_ssl_group = config_p.add_mutually_exclusive_group()
+    satellite_ssl_group.add_argument(
+        "--satellite-verifyssl",
+        dest="satellite_verifyssl",
+        action="store_true",
+        default=None,
+        help="Set satellite.verifyssl=true.",
+    )
+    satellite_ssl_group.add_argument(
+        "--satellite-no-verifyssl",
+        dest="satellite_verifyssl",
+        action="store_false",
+        help="Set satellite.verifyssl=false.",
+    )
+    satellite_push_group = config_p.add_mutually_exclusive_group()
+    satellite_push_group.add_argument(
+        "--satellite-auto-push",
+        dest="satellite_auto_push",
+        action="store_true",
+        default=None,
+        help="Set satellite.auto_push=true.",
+    )
+    satellite_push_group.add_argument(
+        "--satellite-no-auto-push",
+        dest="satellite_auto_push",
+        action="store_false",
+        help="Set satellite.auto_push=false.",
+    )
+    config_p.set_defaults(func=cmd_config)
 
     args = parser.parse_args()
     if not args.command:

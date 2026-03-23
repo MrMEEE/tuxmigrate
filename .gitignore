@@ -1,7 +1,8 @@
 # Built RPMs
 *.rpm
 
-# Generated on first build - contains local config, not meant for version control
+# Generated on first build - contains local config and credentials, not meant for version control
+config.json
 versions.json
 
 # Python cache

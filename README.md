@@ -17,7 +17,7 @@ tuxmigrate build      ← run this when ready
 role/playbooks/       ← files are moved here and versioned
     └── 1.1.0_01_install_vim.yml
 
-tuxmigrate-1.1.0-1.x86_64.rpm  ← produced by fpm
+tuxmigrate-1.1.0-1.x86_64.rpm  ← produced by fpm or rpmbuild
 ```
 
 When the RPM is **installed or upgraded**:
@@ -36,17 +36,21 @@ This means installing a newer RPM on a machine that already has an older version
 | Tool | Purpose |
 |------|---------|
 | Python ≥ 3.10 | Running `tuxmigrate` |
-| [fpm](https://fpm.readthedocs.io/) | Building RPMs |
+| [fpm](https://fpm.readthedocs.io/) | Default RPM builder |
+| `rpmbuild` | Optional native RPM builder |
 | Ansible ≥ 2.14 | On the **target** machine |
 
-Install fpm:
+Install the default builder:
 ```bash
 gem install fpm
 ```
 Remember to add your .bashrc (and update ruby version)
-```
+
+```bash
 export PATH="$HOME/.local/share/gem/ruby/3.3.0/bin:$PATH"
 ```
+
+If you prefer the native RPM toolchain, install `rpmbuild` and build with `--builder rpmbuild`.
 
 ---
 
@@ -74,21 +78,87 @@ You can add multiple files; they will be applied in alphabetical order within a 
 ./tuxmigrate build
 ```
 
-Options (only needed the first time; values are remembered in `versions.json`):
+Options (values are remembered in `config.json` unless overridden):
 
 ```
 --package-name NAME   RPM package name      (default: tuxmigrate)
 --maintainer  EMAIL   RPM maintainer field  (default: tuxmigrate)
 --description TEXT    RPM summary/description
+--builder     BUILDER RPM builder backend   (fpm or rpmbuild)
+--push                 Upload built RPM to Satellite/Katello
+--no-push              Skip Satellite/Katello upload for this build
 ```
 
 This will:
-- Bump the **minor** version (e.g. `1.0.0` → `1.1.0`).
+- Bump the **patch** version by default (e.g. `1.0.0` → `1.0.1`).
 - Move and rename files from `changes/` into `role/playbooks/`.
 - Regenerate `role/tasks/main.yml`.
-- Run `fpm` to produce `<package-name>-<version>-1.x86_64.rpm`.
+- Build `<package-name>-<version>-1.*.rpm` with `fpm` by default, or `rpmbuild` if configured.
 
-### 3. Distribute & install
+### 2a. Configure non-interactively (recommended)
+
+Use `tuxmigrate config` to create or update `config.json` without manual editing:
+
+```bash
+# Create config.json (if missing) and print it
+./tuxmigrate config --init --show
+
+# Set package/build defaults
+./tuxmigrate config \
+    --package-name tuxmigrate \
+    --maintainer ops@example.com \
+    --description "TuxMigrate configuration management" \
+    --builder fpm
+
+# Set Satellite/Katello settings
+./tuxmigrate config \
+    --satellite-servername https://satellite.example.com \
+    --satellite-username admin \
+    --satellite-password 'secret' \
+    --satellite-repository-id 123 \
+    --satellite-verifyssl \
+    --satellite-auto-push
+
+# View current config (password redacted)
+./tuxmigrate config --show
+```
+
+You can still edit `config.json` manually if preferred.
+
+### 3. Optional Satellite/Katello upload
+
+To upload RPMs automatically after each successful build, add a `satellite` section to `config.json`:
+
+```json
+{
+    "version": "1.0.1",
+    "package_name": "tuxmigrate",
+    "maintainer": "tuxmigrate",
+    "description": "TuxMigrate configuration management",
+    "builder": "fpm",
+    "playbooks": [],
+    "satellite": {
+        "auto_push": true,
+        "servername": "https://satellite.example.com",
+        "username": "admin",
+        "password": "secret",
+        "verifyssl": true,
+        "repository_id": "123"
+    }
+}
+```
+
+Required Satellite/Katello fields:
+
+- `servername`
+- `username`
+- `password`
+- `verifyssl`
+- `repository_id`
+
+Set `satellite.auto_push` to `true` to upload automatically on every build, or keep it `false` and use `./tuxmigrate build --push` when needed.
+
+### 4. Distribute & install
 
 ```bash
 sudo dnf install ./tuxmigrate-1.1.0-1.x86_64.rpm
@@ -98,7 +168,7 @@ sudo rpm -Uvh tuxmigrate-1.1.0-1.x86_64.rpm
 
 The post-install script runs immediately and applies any unapplied changes.
 
-### 4. Check status
+### 5. Check status
 
 ```bash
 ./tuxmigrate status
@@ -111,14 +181,14 @@ The post-install script runs immediately and applies any unapplied changes.
 ```
 tuxmigrate/
 ├── tuxmigrate            # CLI entry point (Python)
-├── versions.json         # Version + playbook registry (auto-created on first build, git-ignored)
+├── config.json           # Version/build/Satellite config (auto-created on first build, git-ignored)
 ├── changes/              # Drop new task files here
 ├── role/
 │   ├── meta/main.yml
 │   ├── playbooks/        # All versioned task files (managed by tuxmigrate)
 │   └── tasks/main.yml    # Auto-generated — do not edit
 ├── site.yml              # Ansible playbook run by post-install
-├── post-install.sh       # RPM post-install script (used by fpm)
+├── post-install.sh       # Reference/runtime script; build backends generate their own embedded %post script
 └── .gitignore
 ```
 
@@ -142,7 +212,8 @@ Example (`tuxmigrate_1_1_0_01_install_vim.fact`):
 ## Tips
 
 - **Re-running** `tuxmigrate build` with nothing in `changes/` will error — this prevents accidental empty RPMs.
-- Edit **`versions.json`** directly to change package name, maintainer, or description at any time.
-- `versions.json` is created automatically on the first `tuxmigrate build` and is git-ignored.
+- Edit **`config.json`** directly to change package name, maintainer, builder, or Satellite/Katello upload settings.
+- `config.json` is created automatically on the first `tuxmigrate build` and is git-ignored.
 - The `role/` directory is committed to version control; `*.rpm` files are git-ignored.
-- To target a non-`x86_64` architecture, pass `--architecture` to fpm or set it in a wrapper script.
+- `post-install.sh` behavior remains the runtime reference, but builds do not read this file directly anymore.
+- Existing `versions.json` files are migrated automatically to `config.json`.
