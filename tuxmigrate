@@ -98,30 +98,43 @@ def ensure_config(args: argparse.Namespace) -> None:
     use_katello = input("  Push RPMs to Katello/Satellite? [y/N]: ").strip().lower()
     katello: dict = {"enabled": False}
     if use_katello in ("y", "yes"):
-        kat_url  = prompt_field("Satellite URL", None, "https://satellite.example.com")
-        kat_org  = prompt_field("Organization",  None, "Default Organization")
-        kat_prod = prompt_field("Product",       None, "Custom RPMs")
-        kat_repo = prompt_field("Repository",    None, package_name)
-        ssl_ans  = input("  Verify SSL certificate? [Y/n]: ").strip().lower()
-        kat_ssl  = ssl_ans not in ("n", "no")
+        ssl_ans   = input("  Verify SSL certificate? [Y/n]: ").strip().lower()
+        kat_ssl   = ssl_ans not in ("n", "no")
+        kat_url   = prompt_field("Satellite URL", None, "https://satellite.example.com")
+        kat_token = input("  Personal Access Token: ").strip()
 
-        # Prompt for PAT — used for connection test and stored in versions.json
-        kat_token = input("  Personal Access Token (leave blank to skip connection test): ").strip()
+        # Test connection before proceeding
         if kat_token:
             print("  Testing connection...")
             ok, err = _test_katello(kat_url, kat_token, verify_ssl=kat_ssl)
             if ok:
                 print("  Connection OK.")
             else:
-                print(f"  Connection test failed: {err}", file=sys.stderr)
-                save_anyway = input("  Save Katello config anyway? [y/N]: ").strip().lower()
+                print(f"  Connection failed: {err}", file=sys.stderr)
+                save_anyway = input("  Continue with manual entry anyway? [y/N]: ").strip().lower()
                 if save_anyway not in ("y", "yes"):
                     print("  Katello integration disabled.")
                     use_katello = ""
         else:
-            print("  Skipping connection test.")
+            print("  No token entered — skipping connection test.")
 
         if use_katello in ("y", "yes"):
+            # Organisation
+            orgs = _kat_api_list(kat_url, kat_token, "/api/v2/organizations", verify_ssl=kat_ssl)
+            kat_org = _kat_pick("Organization", orgs, "Default Organization")
+
+            # Product (scoped to chosen org)
+            org_id = next((o["id"] for o in orgs if o["name"] == kat_org), None)
+            prod_path = f"/katello/api/organizations/{org_id}/products" if org_id else "/katello/api/products"
+            prods = _kat_api_list(kat_url, kat_token, prod_path, verify_ssl=kat_ssl)
+            kat_prod = _kat_pick("Product", prods, "Custom RPMs")
+
+            # Repository (scoped to chosen product)
+            prod_id = next((p["id"] for p in prods if p["name"] == kat_prod), None)
+            repo_path = f"/katello/api/products/{prod_id}/repositories" if prod_id else "/katello/api/repositories"
+            repos = _kat_api_list(kat_url, kat_token, repo_path, verify_ssl=kat_ssl)
+            kat_repo = _kat_pick("Repository", repos, package_name)
+
             katello = {
                 "enabled":      True,
                 "url":          kat_url,
@@ -444,6 +457,55 @@ def _test_katello(url: str, token: str, verify_ssl: bool = True) -> tuple[bool, 
         return False, f"HTTP {exc.code} {exc.reason}"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+
+def _kat_ssl_ctx(verify_ssl: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if not verify_ssl:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _kat_api_list(url: str, token: str, path: str, verify_ssl: bool = True) -> list[dict]:
+    """Fetch a paginated Satellite/Katello API list endpoint.
+    Returns a list of dicts with at least 'id' and 'name' keys.
+    Returns [] silently if the request fails (caller falls back to free-text).
+    """
+    api_url = url.rstrip("/") + path + "?per_page=200"
+    req = urllib.request.Request(api_url)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=_kat_ssl_ctx(verify_ssl)) as resp:
+            body = json.loads(resp.read().decode())
+            # Satellite wraps results under 'results'
+            return body.get("results", body) if isinstance(body, dict) else body
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _kat_pick(label: str, items: list[dict], default: str) -> str:
+    """Present a numbered list of Satellite items and return the chosen name.
+    Falls back to free-text entry if the list is empty.
+    """
+    if not items:
+        answer = input(f"  {label} (could not fetch list) [{default}]: ").strip()
+        return answer if answer else default
+    print(f"\n  Available {label}s:")
+    for i, item in enumerate(items, start=1):
+        print(f"    {i}) {item['name']}")
+    while True:
+        raw = input(f"  Select {label} [1-{len(items)}] or type a name: ").strip()
+        if not raw:
+            return default
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(items):
+                return items[idx]["name"]
+            print(f"    Please enter a number between 1 and {len(items)}.")
+        else:
+            return raw
 
 
 def _katello_token(katello_cfg: dict) -> str:
