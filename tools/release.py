@@ -24,7 +24,7 @@ from pathlib import Path
 
 # ── Project layout ─────────────────────────────────────────────────────────────
 PROJECT_ROOT  = Path(__file__).resolve().parent.parent
-VERSION_FILE  = PROJECT_ROOT / "version.py"
+VERSION_FILE  = PROJECT_ROOT / "tools" / "version.py"
 
 # ──────────────────────────────────────────────────────────────────────────────
 
