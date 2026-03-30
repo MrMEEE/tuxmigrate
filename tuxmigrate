@@ -6,6 +6,8 @@ Works similarly to Alembic: place task files into changes/, run `tuxmigrate buil
 and an RPM is produced. Installing the RPM runs all unapplied changes on the host.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
