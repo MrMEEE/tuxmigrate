@@ -142,8 +142,8 @@ def ensure_config(args: argparse.Namespace) -> None:
                 "upload_to_repositories",
             ]
             print("  Looking up and assigning minimal permissions...")
-            perm_ids = _kat_find_permission_ids(kat_url, admin_auth, perm_names, kat_ssl)
-            err = _kat_create_filter(kat_url, admin_auth, role_id, perm_ids, kat_ssl)
+            perms = _kat_find_permission_ids(kat_url, admin_auth, perm_names, kat_ssl)
+            err = _kat_create_filter(kat_url, admin_auth, role_id, perms, kat_ssl)
             if err:
                 print(f"  WARNING: Could not set permissions on role: {err}", file=sys.stderr)
             err = _kat_assign_role_to_user(kat_url, admin_auth, user_id, role_id, kat_ssl)
@@ -560,42 +560,51 @@ def _kat_create_role(
 
 def _kat_find_permission_ids(
     url: str, admin_auth: str, names: list[str], verify_ssl: bool = True,
-) -> list[int]:
-    """Return Foreman permission IDs for the given permission names."""
-    ids: list[int] = []
+) -> list[dict]:
+    """Return Foreman permissions (id + resource_type) for the given permission names."""
+    perms: list[dict] = []
     for name in names:
         path = "/api/v2/permissions?search=" + urllib.parse.quote(f"name = {name}") + "&per_page=5"
         result, err = _kat_get(url, admin_auth, path, verify_ssl)
         if err:
             print(f"    WARNING: could not look up permission '{name}': {err}", file=sys.stderr)
         elif result and result.get("results"):
-            ids.append(result["results"][0]["id"])
-    return ids
+            p = result["results"][0]
+            perms.append({"id": p["id"], "resource_type": p.get("resource_type") or ""})
+    return perms
 
 
 def _kat_create_filter(
-    url: str, admin_auth: str, role_id: int, permission_ids: list[int], verify_ssl: bool = True,
+    url: str, admin_auth: str, role_id: int, permissions: list[dict], verify_ssl: bool = True,
 ) -> str:
-    """Attach permissions to a role via a filter. Returns error string or empty."""
-    payload = {
-        "filter": {
-            "role_id":        role_id,
-            "permission_ids": permission_ids,
-            "unlimited":      True,
+    """Attach permissions to a role. Groups by resource_type (Foreman requirement).
+    Returns concatenated error string or empty."""
+    groups: dict[str, list[int]] = {}
+    for p in permissions:
+        groups.setdefault(p["resource_type"], []).append(p["id"])
+    errors: list[str] = []
+    for rtype, ids in groups.items():
+        payload = {
+            "filter": {
+                "role_id":        role_id,
+                "permission_ids": ids,
+                "unlimited":      True,
+            }
         }
-    }
-    _, err = _kat_post(url, admin_auth, "/api/v2/filters", payload, verify_ssl)
-    return err
+        _, err = _kat_post(url, admin_auth, "/api/v2/filters", payload, verify_ssl)
+        if err:
+            errors.append(f"{rtype}: {err}")
+    return "; ".join(errors)
 
 
 def _kat_assign_role_to_user(
     url: str, admin_auth: str, user_id: int, role_id: int, verify_ssl: bool = True,
 ) -> str:
-    """Assign a role to a user. Returns error string or empty."""
-    _, err = _kat_post(
-        url, admin_auth,
-        f"/api/v2/users/{user_id}/roles",
-        {"role_id": role_id},
+    """Assign a role to a user via PATCH. Returns error string or empty."""
+    _, err = _kat_request(
+        url, admin_auth, "PATCH",
+        f"/api/v2/users/{user_id}",
+        {"user": {"role_ids": [role_id]}},
         verify_ssl,
     )
     return err
