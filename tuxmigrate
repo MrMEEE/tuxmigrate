@@ -155,6 +155,8 @@ def ensure_config(args: argparse.Namespace) -> None:
             kat_token, err = _kat_create_pat(kat_url, admin_auth, user_id, token_name, kat_ssl)
             if err:
                 die(f"Failed to create Personal Access Token: {err}")
+            if not kat_token:
+                die("Personal Access Token was created but Satellite did not return the token value.")
             print(f"  Token created and stored in {VERSIONS_FILE} (git-ignored).")
             print("  KATELLO_TOKEN env var overrides the stored token at build time.\n")
 
@@ -650,7 +652,10 @@ def _kat_create_pat(
 
 def _kat_api_list(url: str, token: str, path: str, verify_ssl: bool = True) -> list[dict]:
     """Fetch a Katello API list using a Bearer token. Returns [] on failure."""
-    result, _ = _kat_get(url, f"Bearer {token}", path + "?per_page=200", verify_ssl)
+    result, err = _kat_get(url, f"Bearer {token}", path + "?per_page=200", verify_ssl)
+    if err:
+        print(f"    WARNING: could not fetch {path}: {err}", file=sys.stderr)
+        return []
     if result is None:
         return []
     return result.get("results", result) if isinstance(result, dict) else result
