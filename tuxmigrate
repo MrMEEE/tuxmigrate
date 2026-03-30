@@ -476,11 +476,11 @@ def main() -> None:
     status_p.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
+    ensure_config(args)
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    ensure_config(args)
     args.func(args)
 
 
