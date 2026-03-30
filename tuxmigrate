@@ -543,6 +543,13 @@ def _kat_create_service_account(
     }
     result, err = _kat_post(url, admin_auth, "/api/v2/users", payload, verify_ssl)
     if err:
+        if "already been taken" in err or "has already been taken" in err:
+            search = urllib.parse.quote(f"login = {login}")
+            found, ferr = _kat_get(url, admin_auth, f"/api/v2/users?search={search}&per_page=2", verify_ssl)
+            if not ferr and found and found.get("results"):
+                uid = found["results"][0]["id"]
+                print(f"    (service account '{login}' already exists, reusing id={uid})")
+                return uid, ""
         return None, err
     return result["id"], ""
 
@@ -554,6 +561,13 @@ def _kat_create_role(
     payload = {"role": {"name": role_name, "description": "Auto-created by tuxmigrate"}}
     result, err = _kat_post(url, admin_auth, "/api/v2/roles", payload, verify_ssl)
     if err:
+        if "already been taken" in err or "has already been taken" in err:
+            search = urllib.parse.quote(f"name = {role_name}")
+            found, ferr = _kat_get(url, admin_auth, f"/api/v2/roles?search={search}&per_page=2", verify_ssl)
+            if not ferr and found and found.get("results"):
+                rid = found["results"][0]["id"]
+                print(f"    (role '{role_name}' already exists, reusing id={rid})")
+                return rid, ""
         return None, err
     return result["id"], ""
 
@@ -618,7 +632,18 @@ def _kat_create_pat(
     payload = {"personal_access_token": {"name": token_name}}
     result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
     if err:
-        return None, err
+        if "already been taken" in err or "has already been taken" in err:
+            # Delete the existing PAT with this name and recreate so we get the token value.
+            list_result, _ = _kat_get(url, admin_auth, path + "?per_page=200", verify_ssl)
+            if list_result and list_result.get("results"):
+                for pat in list_result["results"]:
+                    if pat.get("name") == token_name:
+                        _kat_request(url, admin_auth, "DELETE",
+                                     f"{path}/{pat['id']}", verify_ssl=verify_ssl)
+                        break
+            result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
+        if err:
+            return None, err
     token_val = result.get("value") or result.get("token", "")
     return token_val or None, ""
 
