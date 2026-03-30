@@ -223,11 +223,32 @@ def cmd_build(args: argparse.Namespace) -> None:
     # ensure_config() already ran in main(), so data is guaranteed to exist
     assert data is not None
 
-    old_version = data["version"]
-    new_version = increment_version(old_version, args.bump)
+    # 3. Resolve build metadata early (CLI flag > versions.json > hardcoded default)
+    #    so we can validate and check tool availability before touching any files.
+    package_name = args.package_name or data.get("package_name", "tuxmigrate")
+    maintainer   = args.maintainer   or data.get("maintainer",   "tuxmigrate")
+    description  = args.description  or data.get("description",  "TuxMigrate configuration management")
+    build_tool   = args.build_tool   or data.get("build_tool",   "fpm")
+
+    if build_tool not in SUPPORTED_BUILD_TOOLS:
+        die(f"Unknown build_tool '{build_tool}' in {VERSIONS_FILE}. Choose from: {', '.join(SUPPORTED_BUILD_TOOLS)}.")
+
+    # 4. Ensure the build tool binary is present.
+    if build_tool == "rpmbuild" and not shutil.which("rpmbuild"):
+        answer = input("'rpmbuild' not found. Install rpm-build via dnf? [Y/n]: ").strip().lower()
+        if answer in ("", "y", "yes"):
+            if subprocess.run(["dnf", "-y", "install", "rpm-build"]).returncode != 0:
+                die("Failed to install rpm-build.")
+        else:
+            die("rpmbuild not found. Install rpm-build and try again.")
+
+    # 5. Bump version (save old state for rollback)
+    old_version   = data["version"]
+    old_playbooks = list(data.get("playbooks", []))
+    new_version   = increment_version(old_version, args.bump)
     print(f"Bumping version ({args.bump}): {old_version} -> {new_version}")
 
-    # 3. Move and rename change files into the role
+    # 6. Move and rename change files into the role
     playbooks_path = Path(ROLE_PLAYBOOKS_DIR)
     playbooks_path.mkdir(parents=True, exist_ok=True)
 
@@ -239,12 +260,16 @@ def cmd_build(args: argparse.Namespace) -> None:
         new_entries.append(dest_name)
         print(f"  Moved: {src.name} -> role/playbooks/{dest_name}")
 
-    # 4. Update versions.json
-    data["version"] = new_version
+    # 7. Update versions.json
+    data["version"]      = new_version
+    data["package_name"] = package_name
+    data["maintainer"]   = maintainer
+    data["description"]  = description
+    data["build_tool"]   = build_tool
     data.setdefault("playbooks", []).extend(new_entries)
     save_versions(data)
 
-    # 5. Regenerate role/tasks/main.yml
+    # 8. Regenerate role/tasks/main.yml
     tasks_path = Path(ROLE_TASKS_DIR)
     tasks_path.mkdir(parents=True, exist_ok=True)
     tasks_content = generate_tasks_main(data["playbooks"])
@@ -252,27 +277,25 @@ def cmd_build(args: argparse.Namespace) -> None:
     tasks_file.write_text(tasks_content)
     print(f"\nRegenerated {tasks_file}")
 
-    # 6. Resolve build metadata (CLI flag > versions.json > hardcoded default)
-    package_name = args.package_name or data.get("package_name", "tuxmigrate")
-    maintainer   = args.maintainer   or data.get("maintainer",   "tuxmigrate")
-    description  = args.description  or data.get("description",  "TuxMigrate configuration management")
-    build_tool   = args.build_tool   or data.get("build_tool",   "fpm")
-
-    if build_tool not in SUPPORTED_BUILD_TOOLS:
-        die(f"Unknown build_tool '{build_tool}' in {VERSIONS_FILE}. Choose from: {', '.join(SUPPORTED_BUILD_TOOLS)}.")
-
-    # Persist build metadata for future builds
-    data["package_name"] = package_name
-    data["maintainer"]   = maintainer
-    data["description"]  = description
-    data["build_tool"]   = build_tool
-    save_versions(data)
-
-    # 7. Build the RPM
+    # 9. Build the RPM; roll back everything on failure.
     if build_tool == "fpm":
-        _build_fpm(package_name, new_version, maintainer, description)
+        success = _build_fpm(package_name, new_version, maintainer, description)
     else:
-        _build_rpmbuild(package_name, new_version, maintainer, description)
+        success = _build_rpmbuild(package_name, new_version, maintainer, description)
+
+    if not success:
+        print("\nBuild failed — rolling back changes...", file=sys.stderr)
+        for src, dest_name in zip(pending, new_entries):
+            dest = playbooks_path / dest_name
+            if dest.exists():
+                shutil.move(str(dest), str(src))
+                print(f"  Restored: {dest_name} -> {CHANGES_DIR}/{src.name}")
+        data["version"]   = old_version
+        data["playbooks"] = old_playbooks
+        save_versions(data)
+        tasks_file.write_text(generate_tasks_main(old_playbooks))
+        print(f"  Restored {tasks_file}")
+        die("Build failed. All changes have been rolled back to the changes/ folder.")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -326,7 +349,7 @@ def _print_install_hint(rpm_file: str) -> None:
     )
 
 
-def _build_fpm(package_name: str, version: str, maintainer: str, description: str) -> None:
+def _build_fpm(package_name: str, version: str, maintainer: str, description: str) -> bool:
     cmd = [
         "fpm",
         "-s", "dir",
@@ -343,13 +366,15 @@ def _build_fpm(package_name: str, version: str, maintainer: str, description: st
     ]
     print(f"\nRunning: {' '.join(cmd)}\n")
     if subprocess.run(cmd).returncode != 0:
-        die("fpm failed. Check the output above for details.")
+        print("ERROR: fpm failed. Check the output above for details.", file=sys.stderr)
+        return False
     _print_install_hint(f"{package_name}-{version}-1.x86_64.rpm")
+    return True
 
 
 def _build_rpmbuild(
     package_name: str, version: str, maintainer: str, description: str
-) -> None:
+) -> bool:
     """Generate a minimal .spec file and invoke rpmbuild."""
     install_role = _rpm_role_path(package_name)
     install_site = _rpm_site_yml_path(package_name)
@@ -402,8 +427,10 @@ bash {install_dir}/{POST_INSTALL_SCRIPT}
     ]
     print(f"Running: {' '.join(cmd)}\n")
     if subprocess.run(cmd).returncode != 0:
-        die("rpmbuild failed. Check the output above for details.")
+        print("ERROR: rpmbuild failed. Check the output above for details.", file=sys.stderr)
+        return False
     _print_install_hint(f"{package_name}-{version}-1.noarch.rpm")
+    return True
 
 
 # ---------------------------------------------------------------------------
