@@ -79,6 +79,28 @@ def save_versions(data: dict) -> None:
         fh.write("\n")
 
 
+def ensure_config(args: argparse.Namespace) -> None:
+    """Run the interactive first-time setup if versions.json does not exist yet."""
+    if Path(VERSIONS_FILE).exists():
+        return
+    print(f"{VERSIONS_FILE} not found — initialising new project.")
+    print("Press Enter to accept the [default] or type a new value.\n")
+    package_name = prompt_field("Package name", getattr(args, 'package_name', None), "tuxmigrate")
+    maintainer   = prompt_field("Maintainer",   getattr(args, 'maintainer',   None), "tuxmigrate")
+    description  = prompt_field("Description",  getattr(args, 'description',  None), "TuxMigrate configuration management")
+    build_tool   = prompt_choice("Build tool",   getattr(args, 'build_tool',   None), SUPPORTED_BUILD_TOOLS, "fpm")
+    data = {
+        "version": "1.0.0",
+        "package_name": package_name,
+        "maintainer": maintainer,
+        "description": description,
+        "build_tool": build_tool,
+        "playbooks": [],
+    }
+    save_versions(data)
+    print(f"\nCreated {VERSIONS_FILE} (version 1.0.0)\n")
+
+
 def increment_version(version: str, bump: str = "minor") -> str:
     """Return a new version string with the requested component bumped.
 
@@ -196,25 +218,10 @@ def cmd_build(args: argparse.Namespace) -> None:
     for p in pending:
         print(f"  {p.name}")
 
-    # 2. Load state (bootstrap on first run)
+    # 2. Load state
     data = load_versions()
-    if data is None:
-        print(f"{VERSIONS_FILE} not found — initialising new project.")
-        print("Press Enter to accept the [default] or type a new value.\n")
-        package_name = prompt_field("Package name", args.package_name, "tuxmigrate")
-        maintainer   = prompt_field("Maintainer",   args.maintainer,   "tuxmigrate")
-        description  = prompt_field("Description",  args.description,  "TuxMigrate configuration management")
-        build_tool   = prompt_choice("Build tool",   args.build_tool,   SUPPORTED_BUILD_TOOLS, "fpm")
-        data = {
-            "version": "1.0.0",
-            "package_name": package_name,
-            "maintainer": maintainer,
-            "description": description,
-            "build_tool": build_tool,
-            "playbooks": [],
-        }
-        save_versions(data)
-        print(f"\nCreated {VERSIONS_FILE} (version 1.0.0)\n")
+    # ensure_config() already ran in main(), so data is guaranteed to exist
+    assert data is not None
 
     old_version = data["version"]
     new_version = increment_version(old_version, args.bump)
@@ -271,9 +278,8 @@ def cmd_build(args: argparse.Namespace) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     """Show current version and registered playbooks."""
     data = load_versions()
-    if data is None:
-        print(f"{VERSIONS_FILE} not found. Run 'tuxmigrate build' to initialise the project.")
-        return
+    # ensure_config() already ran in main(), so data is guaranteed to exist
+    assert data is not None
     print(f"Package    : {data.get('package_name', 'tuxmigrate')}")
     print(f"Version    : {data['version']}")
     print(f"Build tool : {data.get('build_tool', 'fpm')}")
@@ -474,6 +480,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(0)
 
+    ensure_config(args)
     args.func(args)
 
 
