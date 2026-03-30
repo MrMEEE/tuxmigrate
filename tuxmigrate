@@ -543,7 +543,7 @@ def _kat_create_service_account(
     }
     result, err = _kat_post(url, admin_auth, "/api/v2/users", payload, verify_ssl)
     if err:
-        if "already been taken" in err or "has already been taken" in err:
+        if "already" in err:
             search = urllib.parse.quote(f"login = {login}")
             found, ferr = _kat_get(url, admin_auth, f"/api/v2/users?search={search}&per_page=2", verify_ssl)
             if not ferr and found and found.get("results"):
@@ -561,7 +561,7 @@ def _kat_create_role(
     payload = {"role": {"name": role_name, "description": "Auto-created by tuxmigrate"}}
     result, err = _kat_post(url, admin_auth, "/api/v2/roles", payload, verify_ssl)
     if err:
-        if "already been taken" in err or "has already been taken" in err:
+        if "already" in err:
             search = urllib.parse.quote(f"name = {role_name}")
             found, ferr = _kat_get(url, admin_auth, f"/api/v2/roles?search={search}&per_page=2", verify_ssl)
             if not ferr and found and found.get("results"):
@@ -632,7 +632,7 @@ def _kat_create_pat(
     payload = {"personal_access_token": {"name": token_name}}
     result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
     if err:
-        if "already been taken" in err or "has already been taken" in err:
+        if "already" in err:
             # Delete the existing PAT with this name and recreate so we get the token value.
             list_result, _ = _kat_get(url, admin_auth, path + "?per_page=200", verify_ssl)
             if list_result and list_result.get("results"):
