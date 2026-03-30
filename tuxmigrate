@@ -9,14 +9,19 @@ and an RPM is produced. Installing the RPM runs all unapplied changes on the hos
 from __future__ import annotations
 
 import argparse
+import base64
+import getpass
 import json
 import os
 import re
+import secrets
 import shutil
 import ssl
+import string
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -98,40 +103,78 @@ def ensure_config(args: argparse.Namespace) -> None:
     use_katello = input("  Push RPMs to Katello/Satellite? [y/N]: ").strip().lower()
     katello: dict = {"enabled": False}
     if use_katello in ("y", "yes"):
-        ssl_ans   = input("  Verify SSL certificate? [Y/n]: ").strip().lower()
-        kat_ssl   = ssl_ans not in ("n", "no")
-        kat_url   = prompt_field("Satellite URL", None, "https://satellite.example.com")
-        kat_token = input("  Personal Access Token: ").strip()
+        kat_url       = prompt_field("Satellite URL", None, "https://satellite.example.com")
+        ssl_ans       = input("  Verify SSL certificate? [Y/n]: ").strip().lower()
+        kat_ssl       = ssl_ans not in ("n", "no")
+        print("  Admin credentials (used for setup only — never saved):")
+        kat_admin_user = prompt_field("Admin username", None, "admin")
+        kat_admin_pass = getpass.getpass("  Admin password: ")
+        admin_auth    = _kat_admin_auth(kat_admin_user, kat_admin_pass)
 
-        # Test connection before proceeding
-        if kat_token:
-            print("  Testing connection...")
-            ok, err = _test_katello(kat_url, kat_token, verify_ssl=kat_ssl)
-            if ok:
-                print("  Connection OK.")
-            else:
-                print(f"  Connection failed: {err}", file=sys.stderr)
-                save_anyway = input("  Continue with manual entry anyway? [y/N]: ").strip().lower()
-                if save_anyway not in ("y", "yes"):
-                    print("  Katello integration disabled.")
-                    use_katello = ""
+        print("  Testing admin connection...")
+        _, conn_err = _kat_get(kat_url, admin_auth, "/api/v2/ping", verify_ssl=kat_ssl)
+        if conn_err:
+            print(f"  Connection failed: {conn_err}", file=sys.stderr)
+            cont = input("  Continue anyway? [y/N]: ").strip().lower()
+            if cont not in ("y", "yes"):
+                print("  Katello integration disabled.")
+                use_katello = ""
         else:
-            print("  No token entered — skipping connection test.")
+            print("  Connection OK.")
 
         if use_katello in ("y", "yes"):
-            # Organisation
+            svc_login = package_name
+            print(f"\n  Creating service account '{svc_login}'...")
+            user_id, err = _kat_create_service_account(kat_url, admin_auth, svc_login, kat_ssl)
+            if err:
+                die(f"Failed to create Katello service account: {err}")
+
+            role_name = f"tuxmigrate-{svc_login}"
+            print(f"  Creating role '{role_name}'...")
+            role_id, err = _kat_create_role(kat_url, admin_auth, role_name, kat_ssl)
+            if err:
+                die(f"Failed to create Katello role: {err}")
+
+            perm_names = [
+                "view_organizations",
+                "view_products",
+                "view_repositories",
+                "upload_to_repositories",
+            ]
+            print("  Looking up and assigning minimal permissions...")
+            perm_ids = _kat_find_permission_ids(kat_url, admin_auth, perm_names, kat_ssl)
+            err = _kat_create_filter(kat_url, admin_auth, role_id, perm_ids, kat_ssl)
+            if err:
+                print(f"  WARNING: Could not set permissions on role: {err}", file=sys.stderr)
+            err = _kat_assign_role_to_user(kat_url, admin_auth, user_id, role_id, kat_ssl)
+            if err:
+                print(f"  WARNING: Could not assign role to user: {err}", file=sys.stderr)
+
+            token_name = f"tuxmigrate-{svc_login}"
+            print(f"  Creating Personal Access Token '{token_name}'...")
+            kat_token, err = _kat_create_pat(kat_url, admin_auth, user_id, token_name, kat_ssl)
+            if err:
+                die(f"Failed to create Personal Access Token: {err}")
+            print(f"  Token created and stored in {VERSIONS_FILE} (git-ignored).")
+            print("  KATELLO_TOKEN env var overrides the stored token at build time.\n")
+
+            # Use the new service account token to select org / product / repo
             orgs = _kat_api_list(kat_url, kat_token, "/api/v2/organizations", verify_ssl=kat_ssl)
             kat_org = _kat_pick("Organization", orgs, "Default Organization")
 
-            # Product (scoped to chosen org)
             org_id = next((o["id"] for o in orgs if o["name"] == kat_org), None)
-            prod_path = f"/katello/api/organizations/{org_id}/products" if org_id else "/katello/api/products"
+            prod_path = (
+                f"/katello/api/organizations/{org_id}/products"
+                if org_id else "/katello/api/products"
+            )
             prods = _kat_api_list(kat_url, kat_token, prod_path, verify_ssl=kat_ssl)
             kat_prod = _kat_pick("Product", prods, "Custom RPMs")
 
-            # Repository (scoped to chosen product)
             prod_id = next((p["id"] for p in prods if p["name"] == kat_prod), None)
-            repo_path = f"/katello/api/products/{prod_id}/repositories" if prod_id else "/katello/api/repositories"
+            repo_path = (
+                f"/katello/api/products/{prod_id}/repositories"
+                if prod_id else "/katello/api/repositories"
+            )
             repos = _kat_api_list(kat_url, kat_token, repo_path, verify_ssl=kat_ssl)
             kat_repo = _kat_pick("Repository", repos, package_name)
 
@@ -144,12 +187,6 @@ def ensure_config(args: argparse.Namespace) -> None:
                 "ssl_verify":   kat_ssl,
                 "token":        kat_token,
             }
-            if kat_token:
-                print(f"  Token stored in {VERSIONS_FILE} (git-ignored).")
-                print("  KATELLO_TOKEN env var overrides the stored token at build time.")
-            else:
-                print("  No token stored. Set KATELLO_TOKEN env var or you will")
-                print("  be prompted on each build.")
 
     data = {
         "version": "1.0.0",
@@ -438,27 +475,6 @@ def _print_install_hint(rpm_file: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _test_katello(url: str, token: str, verify_ssl: bool = True) -> tuple[bool, str]:
-    """Hit /api/v2/ping on a Satellite/Katello server using a PAT. Returns (ok, error_message)."""
-    ping_url = url.rstrip("/") + "/api/v2/ping"
-    req = urllib.request.Request(ping_url)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Accept", "application/json")
-    ctx = ssl.create_default_context()
-    if not verify_ssl:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    try:
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            if resp.status == 200:
-                return True, ""
-            return False, f"HTTP {resp.status}"
-    except urllib.error.HTTPError as exc:
-        return False, f"HTTP {exc.code} {exc.reason}"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-
-
 def _kat_ssl_ctx(verify_ssl: bool) -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     if not verify_ssl:
@@ -467,22 +483,143 @@ def _kat_ssl_ctx(verify_ssl: bool) -> ssl.SSLContext:
     return ctx
 
 
-def _kat_api_list(url: str, token: str, path: str, verify_ssl: bool = True) -> list[dict]:
-    """Fetch a paginated Satellite/Katello API list endpoint.
-    Returns a list of dicts with at least 'id' and 'name' keys.
-    Returns [] silently if the request fails (caller falls back to free-text).
-    """
-    api_url = url.rstrip("/") + path + "?per_page=200"
-    req = urllib.request.Request(api_url)
-    req.add_header("Authorization", f"Bearer {token}")
+def _kat_admin_auth(admin_user: str, admin_pass: str) -> str:
+    """Return a Basic auth header value for admin username/password."""
+    return "Basic " + base64.b64encode(f"{admin_user}:{admin_pass}".encode()).decode()
+
+
+def _kat_request(
+    url: str, auth: str, method: str, path: str,
+    payload: dict | None = None, verify_ssl: bool = True,
+) -> tuple[dict | None, str]:
+    """Generic Satellite/Katello API call. Returns (body_dict_or_None, error_str)."""
+    full_url = url.rstrip("/") + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(full_url, data=data, method=method)
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=15, context=_kat_ssl_ctx(verify_ssl)) as resp:
-            body = json.loads(resp.read().decode())
-            # Satellite wraps results under 'results'
-            return body.get("results", body) if isinstance(body, dict) else body
-    except Exception:  # noqa: BLE001
+        with urllib.request.urlopen(req, timeout=30, context=_kat_ssl_ctx(verify_ssl)) as resp:
+            return json.loads(resp.read().decode()), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode()
+        except Exception:
+            detail = ""
+        return None, f"HTTP {exc.code}: {detail}"
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+
+
+def _kat_get(url: str, auth: str, path: str, verify_ssl: bool = True) -> tuple[dict | None, str]:
+    return _kat_request(url, auth, "GET", path, verify_ssl=verify_ssl)
+
+
+def _kat_post(
+    url: str, auth: str, path: str, payload: dict, verify_ssl: bool = True,
+) -> tuple[dict | None, str]:
+    return _kat_request(url, auth, "POST", path, payload, verify_ssl)
+
+
+def _kat_create_service_account(
+    url: str, admin_auth: str, login: str, verify_ssl: bool = True,
+) -> tuple[int | None, str]:
+    """Create a local Foreman user for tuxmigrate. Returns (user_id, error)."""
+    password = "".join(
+        secrets.choice(string.ascii_letters + string.digits + "!@#$%^&*")
+        for _ in range(32)
+    )
+    payload = {
+        "user": {
+            "login":          login,
+            "firstname":      "TuxMigrate",
+            "lastname":       "Service",
+            "mail":           f"{login}@localhost.invalid",
+            "password":       password,
+            "auth_source_id": 1,   # 1 = internal database
+            "admin":          False,
+        }
+    }
+    result, err = _kat_post(url, admin_auth, "/api/v2/users", payload, verify_ssl)
+    if err:
+        return None, err
+    return result["id"], ""
+
+
+def _kat_create_role(
+    url: str, admin_auth: str, role_name: str, verify_ssl: bool = True,
+) -> tuple[int | None, str]:
+    """Create a custom Foreman role. Returns (role_id, error)."""
+    payload = {"role": {"name": role_name, "description": "Auto-created by tuxmigrate"}}
+    result, err = _kat_post(url, admin_auth, "/api/v2/roles", payload, verify_ssl)
+    if err:
+        return None, err
+    return result["id"], ""
+
+
+def _kat_find_permission_ids(
+    url: str, admin_auth: str, names: list[str], verify_ssl: bool = True,
+) -> list[int]:
+    """Return Foreman permission IDs for the given permission names."""
+    ids: list[int] = []
+    for name in names:
+        path = "/api/v2/permissions?search=" + urllib.parse.quote(f"name = {name}") + "&per_page=5"
+        result, err = _kat_get(url, admin_auth, path, verify_ssl)
+        if err:
+            print(f"    WARNING: could not look up permission '{name}': {err}", file=sys.stderr)
+        elif result and result.get("results"):
+            ids.append(result["results"][0]["id"])
+    return ids
+
+
+def _kat_create_filter(
+    url: str, admin_auth: str, role_id: int, permission_ids: list[int], verify_ssl: bool = True,
+) -> str:
+    """Attach permissions to a role via a filter. Returns error string or empty."""
+    payload = {
+        "filter": {
+            "role_id":        role_id,
+            "permission_ids": permission_ids,
+            "unlimited":      True,
+        }
+    }
+    _, err = _kat_post(url, admin_auth, "/api/v2/filters", payload, verify_ssl)
+    return err
+
+
+def _kat_assign_role_to_user(
+    url: str, admin_auth: str, user_id: int, role_id: int, verify_ssl: bool = True,
+) -> str:
+    """Assign a role to a user. Returns error string or empty."""
+    _, err = _kat_post(
+        url, admin_auth,
+        f"/api/v2/users/{user_id}/roles",
+        {"role_id": role_id},
+        verify_ssl,
+    )
+    return err
+
+
+def _kat_create_pat(
+    url: str, admin_auth: str, user_id: int, token_name: str, verify_ssl: bool = True,
+) -> tuple[str | None, str]:
+    """Create a Personal Access Token for a user. Returns (token_value, error)."""
+    path = f"/api/v2/users/{user_id}/personal_access_tokens"
+    payload = {"personal_access_token": {"name": token_name}}
+    result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
+    if err:
+        return None, err
+    token_val = result.get("value") or result.get("token", "")
+    return token_val or None, ""
+
+
+def _kat_api_list(url: str, token: str, path: str, verify_ssl: bool = True) -> list[dict]:
+    """Fetch a Katello API list using a Bearer token. Returns [] on failure."""
+    result, _ = _kat_get(url, f"Bearer {token}", path + "?per_page=200", verify_ssl)
+    if result is None:
         return []
+    return result.get("results", result) if isinstance(result, dict) else result
 
 
 def _kat_pick(label: str, items: list[dict], default: str) -> str:
