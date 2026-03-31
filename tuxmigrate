@@ -12,6 +12,7 @@ import argparse
 import base64
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -185,15 +186,18 @@ def ensure_config(args: argparse.Namespace) -> None:
             )
             repos = _kat_api_list(kat_url, kat_pat_auth, repo_path, verify_ssl=kat_ssl)
             kat_repo = _kat_pick("Repository", repos, package_name)
+            repo_id = next((r["id"] for r in repos if r["name"] == kat_repo), None)
 
             katello = {
-                "enabled":      True,
-                "url":          kat_url,
-                "organization": kat_org,
-                "product":      kat_prod,
-                "repository":   kat_repo,
-                "ssl_verify":   kat_ssl,
-                "token":        kat_token,
+                "enabled":       True,
+                "url":           kat_url,
+                "organization":  kat_org,
+                "product":       kat_prod,
+                "repository":    kat_repo,
+                "repository_id": repo_id,
+                "login":         svc_login,
+                "ssl_verify":    kat_ssl,
+                "token":         kat_token,
             }
 
     data = {
@@ -836,39 +840,89 @@ def _katello_token(katello_cfg: dict) -> str:
 
 
 def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
-    """Upload *rpm_file* to the configured Katello/Satellite repository via hammer."""
+    """Upload *rpm_file* to the configured Katello repository via the API."""
     if not Path(rpm_file).exists():
         print(f"WARNING: RPM file '{rpm_file}' not found, skipping Katello upload.", file=sys.stderr)
         return
-    if not shutil.which("hammer"):
-        print("WARNING: 'hammer' CLI not found — skipping Katello upload.", file=sys.stderr)
-        print("         Install foreman-cli (yum install rubygem-hammer_cli_katello) and re-run:")
-        print(f"         hammer repository upload-content \\"
-              f"--organization '{katello_cfg['organization']}' \\"
-              f"--product '{katello_cfg['product']}' \\"
-              f"--name '{katello_cfg['repository']}' \\"
-              f"--path {rpm_file}")
+
+    url        = katello_cfg["url"]
+    verify_ssl = katello_cfg.get("ssl_verify", True)
+    token      = _katello_token(katello_cfg)
+    login      = katello_cfg.get("login", "")
+    repo_id    = katello_cfg.get("repository_id")
+    auth       = _kat_admin_auth(login, token)
+
+    if not login or not repo_id:
+        print("ERROR: Katello config is missing 'login' or 'repository_id'.", file=sys.stderr)
+        print("       Re-run 'tuxmigrate status' or reconfigure with a fresh versions.json.", file=sys.stderr)
         return
 
-    token = _katello_token(katello_cfg)
+    rpm_path  = Path(rpm_file)
+    file_data = rpm_path.read_bytes()
+    file_size = len(file_data)
+    checksum  = hashlib.sha256(file_data).hexdigest()
+    filename  = rpm_path.name
 
-    cmd = [
-        "hammer",
-        "--server", katello_cfg["url"],
-        "--token",  token,
-        "repository", "upload-content",
-        "--organization", katello_cfg["organization"],
-        "--product",      katello_cfg["product"],
-        "--name",         katello_cfg["repository"],
-        "--path",         rpm_file,
-    ]
-    # Log the command with the token redacted
-    safe = cmd[:4] + ["--token", "***"] + cmd[6:]
-    print(f"\nPushing to Katello: {' '.join(safe)}")
-    if subprocess.run(cmd).returncode != 0:
-        print("ERROR: Katello upload failed. Check the output above.", file=sys.stderr)
+    print(f"\nUploading {filename} to Katello via API...")
+
+    # Step 1: Create an upload request
+    result, err = _kat_post(url, auth, "/katello/api/v2/content_uploads", {}, verify_ssl)
+    if err or not result:
+        print(f"ERROR: Could not create upload request: {err}", file=sys.stderr)
+        return
+    upload_id = result.get("upload_id")
+    if not upload_id:
+        print(f"ERROR: No upload_id in response: {result}", file=sys.stderr)
+        return
+
+    # Step 2: PUT the file as multipart/form-data
+    boundary = "--------tuxmigrate_boundary"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="size"\r\n\r\n'
+        f"{file_size}\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="offset"\r\n\r\n'
+        f"0\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="content"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+
+    put_url = url.rstrip("/") + f"/katello/api/v2/content_uploads/{upload_id}"
+    req = urllib.request.Request(put_url, data=body, method="PUT")
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=120, context=_kat_ssl_ctx(verify_ssl)) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode()
+        except Exception:
+            pass
+        print(f"ERROR: File upload failed: HTTP {exc.code}: {detail}", file=sys.stderr)
+        return
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: File upload failed: {exc}", file=sys.stderr)
+        return
+
+    # Step 3: Import the upload into the repository and publish
+    import_payload = {
+        "uploads": [{"id": upload_id, "name": filename, "checksum": checksum, "size": file_size}],
+        "publish_repository": True,
+    }
+    result, err = _kat_post(
+        url, auth,
+        f"/katello/api/v2/repositories/{repo_id}/import_uploads",
+        import_payload, verify_ssl,
+    )
+    if err:
+        print(f"ERROR: Failed to import upload into repository: {err}", file=sys.stderr)
     else:
-        print(f"  Uploaded {rpm_file} to {katello_cfg['url']}")
+        print(f"  Uploaded and published {filename} to Katello repository.")
 
 
 def _build_fpm(package_name: str, version: str, maintainer: str, description: str) -> bool:
