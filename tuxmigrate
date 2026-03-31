@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import getpass
 import json
 import os
@@ -797,6 +798,13 @@ def _build_rpmbuild(
     install_site = _rpm_site_yml_path(package_name)
     install_dir  = f"/usr/share/{package_name}"
 
+    # Absolute paths so %install works regardless of rpmbuild's working directory.
+    project_root = Path(".").resolve()
+    abs_role_dir = project_root / ROLE_DIR
+    abs_site_yml = project_root / SITE_YML
+
+    changelog_date = datetime.datetime.now().strftime("%a %b %d %Y")
+
     spec_content = f"""%define _rpmdir %(pwd)
 
 Name:        {package_name}
@@ -813,8 +821,8 @@ Packager:    {maintainer}
 %install
 mkdir -p %{{buildroot}}{install_role}
 mkdir -p %{{buildroot}}{install_dir}
-cp -r {ROLE_DIR}/* %{{buildroot}}{install_role}/
-cp {SITE_YML} %{{buildroot}}{install_dir}/
+cp -r {abs_role_dir}/* %{{buildroot}}{install_role}/
+cp {abs_site_yml} %{{buildroot}}{install_dir}/
 
 %files
 %{{_usr}}/share/{package_name}/
@@ -823,7 +831,7 @@ cp {SITE_YML} %{{buildroot}}{install_dir}/
 bash {install_dir}/{POST_INSTALL_SCRIPT}
 
 %changelog
-* $(date '+%a %b %d %Y') {maintainer} - {version}-1
+* {changelog_date} {maintainer} - {version}-1
 - tuxmigrate automated build
 """
 
