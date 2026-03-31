@@ -688,6 +688,32 @@ def _rpm_output_dir(package_name: str) -> Path:
     return Path(f"{package_name}-rpms")
 
 
+def _generate_post_install(package_name: str) -> None:
+    """Write post-install.sh with the correct install path for package_name."""
+    install_dir = f"/usr/share/{package_name}"
+    content = f"""#!/usr/bin/env bash
+# post-install.sh - executed by rpm after the package is installed/upgraded.
+# Runs the {package_name} role on the local machine.
+set -euo pipefail
+
+SITE_YML="{install_dir}/site.yml"
+
+echo "[{package_name}] Running configuration changes..."
+
+if ! command -v ansible-playbook &>/dev/null; then
+    echo "[{package_name}] ERROR: ansible-playbook not found. Install Ansible and re-run:"
+    echo "  ansible-playbook ${{SITE_YML}} -c local"
+    exit 1
+fi
+
+ansible-playbook "${{SITE_YML}}" --connection=local
+
+echo "[{package_name}] Done."
+"""
+    Path(POST_INSTALL_SCRIPT).write_text(content)
+    Path(POST_INSTALL_SCRIPT).chmod(0o755)
+
+
 def _print_install_hint(rpm_file: str) -> None:
     print(f"\nBuild complete: {rpm_file}")
     print(
@@ -1177,6 +1203,7 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
 
 
 def _build_fpm(package_name: str, version: str, maintainer: str, description: str) -> bool:
+    _generate_post_install(package_name)
     output_dir = _rpm_output_dir(package_name)
     output_dir.mkdir(exist_ok=True)
     cmd = [
@@ -1206,6 +1233,7 @@ def _build_rpmbuild(
     package_name: str, version: str, maintainer: str, description: str
 ) -> bool:
     """Generate a minimal .spec file and invoke rpmbuild."""
+    _generate_post_install(package_name)
     install_role = _rpm_role_path(package_name)
     install_site = _rpm_site_yml_path(package_name)
     install_dir  = f"/usr/share/{package_name}"

@@ -6,6 +6,9 @@
 config.json
 versions.json
 
+# Generated at build time with package-specific install path
+post-install.sh
+
 # Python cache
 __pycache__/
 *.pyc
