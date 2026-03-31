@@ -635,14 +635,22 @@ def _kat_create_pat(
     result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
     if err:
         if "already" in err:
-            # Delete the existing PAT with this name and recreate so we get the token value.
-            list_result, _ = _kat_get(url, admin_auth, path + "?per_page=200", verify_ssl)
-            if list_result and list_result.get("results"):
-                for pat in list_result["results"]:
-                    if pat.get("name") == token_name:
-                        _kat_request(url, admin_auth, "DELETE",
-                                     f"{path}/{pat['id']}", verify_ssl=verify_ssl)
-                        break
+            # Delete the existing PAT with this name and recreate to capture the token value.
+            list_result, list_err = _kat_get(url, admin_auth, path + "?per_page=200", verify_ssl)
+            if list_err:
+                return None, f"PAT already exists and could not list existing PATs: {list_err}"
+            # Foreman may return {"results": [...]} or a bare list.
+            pats = (
+                list_result.get("results", []) if isinstance(list_result, dict)
+                else list_result or []
+            )
+            pat_id = next((p["id"] for p in pats if p.get("name") == token_name), None)
+            if pat_id is None:
+                return None, f"PAT '{token_name}' reported as taken but was not found in list"
+            _, del_err = _kat_request(url, admin_auth, "DELETE",
+                                      f"{path}/{pat_id}", verify_ssl=verify_ssl)
+            if del_err:
+                return None, f"Could not delete existing PAT '{token_name}': {del_err}"
             result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
         if err:
             return None, err
