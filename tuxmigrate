@@ -1212,8 +1212,9 @@ def _build_rpmbuild(
 
     # Absolute paths so %install works regardless of rpmbuild's working directory.
     project_root = Path(".").resolve()
-    abs_role_dir = project_root / ROLE_DIR
-    abs_site_yml = project_root / SITE_YML
+    abs_role_dir       = project_root / ROLE_DIR
+    abs_site_yml       = project_root / SITE_YML
+    abs_post_install   = project_root / POST_INSTALL_SCRIPT
 
     output_dir = _rpm_output_dir(package_name)
     output_dir.mkdir(exist_ok=True)
@@ -1239,6 +1240,8 @@ mkdir -p %{{buildroot}}{install_role}
 mkdir -p %{{buildroot}}{install_dir}
 cp -r {abs_role_dir}/* %{{buildroot}}{install_role}/
 cp {abs_site_yml} %{{buildroot}}{install_dir}/
+cp {abs_post_install} %{{buildroot}}{install_dir}/
+chmod +x %{{buildroot}}{install_dir}/{POST_INSTALL_SCRIPT}
 
 %files
 %{{_usr}}/share/{package_name}/
