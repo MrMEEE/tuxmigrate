@@ -260,6 +260,51 @@ def register_var(playbook_filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_full_playbook(path: Path) -> bool:
+    """Return True if the YAML file is a full Ansible playbook (contains hosts: key)."""
+    for line in path.read_text().splitlines():
+        if re.match(r"^  hosts\s*:", line):
+            return True
+    return False
+
+
+def _normalize_playbook_if_needed(path: Path) -> bool:
+    """If path is a full Ansible playbook, convert it to a tasks-only file in-place.
+
+    Returns True if a conversion was performed.
+    """
+    if not _is_full_playbook(path):
+        return False
+
+    venv_python = Path(LINT_VENV_DIR) / "bin" / "python3"
+    if not venv_python.exists():
+        die(
+            f"Cannot auto-convert full playbook '{path.name}' to a task file: "
+            f"lint venv not found. Either run 'tuxmigrate build' first (which creates "
+            f"the venv), or rewrite the file as a task list (remove the top-level "
+            f"'hosts:' / 'name:' play wrapper and keep only the tasks list)."
+        )
+
+    script = (
+        "import sys, yaml\n"
+        "plays = yaml.safe_load(open(sys.argv[1]))\n"
+        "tasks = []\n"
+        "for p in plays:\n"
+        "    tasks.extend(p.get('pre_tasks', []))\n"
+        "    tasks.extend(p.get('tasks', []))\n"
+        "    tasks.extend(p.get('post_tasks', []))\n"
+        "print(yaml.dump(tasks, default_flow_style=False, allow_unicode=True))\n"
+    )
+    result = subprocess.run(
+        [str(venv_python), "-c", script, str(path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        die(f"Failed to extract tasks from '{path.name}': {result.stderr.strip()}")
+    path.write_text(result.stdout)
+    return True
+
+
 def generate_tasks_main(playbooks: list[str]) -> str:
     """Generate the content of role/tasks/main.yml for the given ordered list
     of playbook filenames."""
@@ -473,8 +518,11 @@ def cmd_build(args: argparse.Namespace) -> None:
         dest_name = f"{new_version}_{idx:02d}_{src.name}"
         dest = playbooks_path / dest_name
         shutil.move(str(src), str(dest))
+        if _normalize_playbook_if_needed(dest):
+            print(f"  Converted full playbook to task file: {src.name} -> role/playbooks/{dest_name}")
+        else:
+            print(f"  Moved: {src.name} -> role/playbooks/{dest_name}")
         new_entries.append(dest_name)
-        print(f"  Moved: {src.name} -> role/playbooks/{dest_name}")
 
     # 7. Update versions.json
     data["version"]      = new_version
@@ -566,6 +614,23 @@ def cmd_rebuild(args: argparse.Namespace) -> None:
                 die("Failed to install rpm-build.")
         else:
             die("rpmbuild not found. Install rpm-build and try again.")
+
+    # Convert any full playbooks already in role/playbooks/ to task files in-place.
+    playbooks_path = Path(ROLE_PLAYBOOKS_DIR)
+    converted_any = False
+    if playbooks_path.exists():
+        _ensure_lint_venv()
+        for pb_file in sorted(playbooks_path.iterdir()):
+            if pb_file.suffix in {".yml", ".yaml"} and pb_file.is_file():
+                if _normalize_playbook_if_needed(pb_file):
+                    print(f"  Converted full playbook to task file: {pb_file.name}")
+                    converted_any = True
+
+    if converted_any:
+        tasks_path = Path(ROLE_TASKS_DIR)
+        tasks_content = generate_tasks_main(all_playbooks)
+        (tasks_path / "main.yml").write_text(tasks_content)
+        print(f"Regenerated {ROLE_TASKS_DIR}/main.yml")
 
     print(f"Rebuilding RPM for version {version} (build tool: {build_tool})...")
 
