@@ -157,7 +157,11 @@ def ensure_config(args: argparse.Namespace) -> None:
             if err:
                 die(f"Failed to create Personal Access Token: {err}")
             if not kat_token:
-                die("Personal Access Token was created but Satellite did not return the token value.")
+                print("  WARNING: Satellite did not return a token value (see DEBUG line above).",
+                      file=sys.stderr)
+                kat_token = input("  Paste the token manually (or press Enter to abort Katello setup): ").strip()
+                if not kat_token:
+                    die("Cannot continue without a Katello token.")
             print(f"  Token created and stored in {VERSIONS_FILE} (git-ignored).")
             print("  KATELLO_TOKEN env var overrides the stored token at build time.\n")
 
@@ -679,6 +683,10 @@ def _kat_create_pat(
         if err:
             return None, err
     token_val = result.get("value") or result.get("token", "")
+    if not token_val:
+        # Log the actual response keys to help diagnose unexpected response shapes.
+        print(f"    DEBUG PAT response keys: {list(result.keys()) if isinstance(result, dict) else result}",
+              file=sys.stderr)
     return token_val or None, ""
 
 
