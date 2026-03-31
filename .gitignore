@@ -11,6 +11,9 @@ __pycache__/
 *.pyo
 .eggs/
 
+# Lint venv (created automatically on first build)
+.tuxmigrate-venv/
+
 # Editor
 .vscode/
 *.swp
