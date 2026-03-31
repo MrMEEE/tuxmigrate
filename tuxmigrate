@@ -526,6 +526,69 @@ def cmd_build(args: argparse.Namespace) -> None:
         _push_katello(rpm_file, katello_cfg)
 
 
+def cmd_rebuild(args: argparse.Namespace) -> None:
+    """Re-run the RPM build for a specific already-released version.
+
+    Does NOT bump the version or move any files — it simply re-invokes the
+    build tool using the metadata that was saved at build time.
+    """
+    data = load_versions()
+    assert data is not None
+
+    package_name = data.get("package_name", "tuxmigrate")
+    maintainer   = data.get("maintainer",   "tuxmigrate")
+    description  = data.get("description",  "TuxMigrate configuration management")
+    build_tool   = data.get("build_tool",   "fpm")
+    version      = args.version
+
+    # Verify the version exists in recorded history
+    all_playbooks = data.get("playbooks", [])
+    version_playbooks = [p for p in all_playbooks if p.startswith(f"{version}_")]
+    if not version_playbooks:
+        # The current version has no prefix — check if it matches exactly
+        if data["version"] != version:
+            die(
+                f"Version {version} not found in {VERSIONS_FILE}.\n"
+                f"Current version is {data['version']}. "
+                f"Use 'tuxmigrate status' to see recorded playbooks."
+            )
+
+    if build_tool not in SUPPORTED_BUILD_TOOLS:
+        die(f"Unknown build_tool '{build_tool}'. Choose from: {', '.join(SUPPORTED_BUILD_TOOLS)}.")
+
+    # Ensure rpmbuild is available if needed
+    if build_tool == "rpmbuild" and not shutil.which("rpmbuild"):
+        answer = input("'rpmbuild' not found. Install rpm-build via dnf? [Y/n]: ").strip().lower()
+        if answer in ("", "y", "yes"):
+            if subprocess.run(["dnf", "-y", "install", "rpm-build"]).returncode != 0:
+                die("Failed to install rpm-build.")
+        else:
+            die("rpmbuild not found. Install rpm-build and try again.")
+
+    print(f"Rebuilding RPM for version {version} (build tool: {build_tool})...")
+
+    if build_tool == "fpm":
+        success = _build_fpm(package_name, version, maintainer, description)
+    else:
+        success = _build_rpmbuild(package_name, version, maintainer, description)
+
+    if not success:
+        die("Rebuild failed. Check the output above for details.")
+
+    if args.upload:
+        katello_cfg = data.get("katello", {})
+        if not katello_cfg.get("enabled"):
+            print("WARNING: Katello is not enabled; skipping upload.", file=sys.stderr)
+        else:
+            output_dir = _rpm_output_dir(package_name)
+            rpm_name = (
+                f"{package_name}-{version}-1.x86_64.rpm"
+                if build_tool == "fpm"
+                else f"{package_name}-{version}-1.noarch.rpm"
+            )
+            _push_katello(str(output_dir / rpm_name), katello_cfg)
+
+
 def cmd_upload(args: argparse.Namespace) -> None:
     """Upload the RPM for a specific version to Katello without rebuilding."""
     data = load_versions()
@@ -1146,6 +1209,23 @@ def main() -> None:
         help="Version to upload, e.g. 1.0.3",
     )
     upload_p.set_defaults(func=cmd_upload)
+
+    # rebuild
+    rebuild_p = sub.add_parser(
+        "rebuild",
+        help="Re-build the RPM for a specific version without bumping or moving files.",
+    )
+    rebuild_p.add_argument(
+        "version",
+        metavar="VERSION",
+        help="Version to rebuild, e.g. 1.0.3",
+    )
+    rebuild_p.add_argument(
+        "--upload",
+        action="store_true",
+        help="Upload the rebuilt RPM to Katello/Satellite afterwards.",
+    )
+    rebuild_p.set_defaults(func=cmd_rebuild)
 
     # remove
     remove_p = sub.add_parser(
