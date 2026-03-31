@@ -1114,8 +1114,8 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
     print(f"\nUploading {filename} to Katello via API...")
 
     # Step 1: Create an upload request (scoped to this repository)
-    # Pulp requires 'size' in the creation body.
-    result, err = _kat_post(url, auth, f"/katello/api/v2/repositories/{repo_id}/content_uploads", {"size": file_size}, verify_ssl)
+    # Pulp requires 'size'; content_type helps route correctly.
+    result, err = _kat_post(url, auth, f"/katello/api/v2/repositories/{repo_id}/content_uploads", {"size": file_size, "content_type": "rpm"}, verify_ssl)
     if err or not result:
         print(f"ERROR: Could not create upload request: {err}", file=sys.stderr)
         return
@@ -1159,12 +1159,14 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
         return
 
     # Step 3: Import the upload into the repository and publish
+    # The official Katello API uses PUT for import_uploads, not POST.
     import_payload = {
-        "uploads": [{"id": upload_id, "name": filename, "checksum": checksum, "size": file_size}],
+        "uploads": [{"id": upload_id, "checksum": checksum, "size": str(file_size)}],
         "publish_repository": True,
+        "content_type": "rpm",
     }
-    result, err = _kat_post(
-        url, auth,
+    result, err = _kat_request(
+        url, auth, "PUT",
         f"/katello/api/v2/repositories/{repo_id}/import_uploads",
         import_payload, verify_ssl,
     )
