@@ -142,6 +142,7 @@ def ensure_config(args: argparse.Namespace) -> None:
             perm_names = [
                 "view_organizations",
                 "view_products",
+                "edit_products",
                 "view_repositories",
                 "upload_to_repositories",
             ]
@@ -1017,6 +1018,71 @@ def _kat_repair_config(data: dict) -> dict:
     if changed:
         data["katello"] = katello
         save_versions(data)
+
+    # Repair role permissions if edit_products was missing (added in a later release).
+    # Tracked by 'permissions_v2' flag to avoid prompting for admin creds repeatedly.
+    if not katello.get("permissions_v2"):
+        url        = katello.get("url", "")
+        verify_ssl = katello.get("ssl_verify", True)
+        login      = katello.get("login", "")
+        token      = _katello_token(katello)
+        auth       = _kat_admin_auth(login, token)
+        role_name  = f"tuxmigrate-{login}"
+
+        # Check whether the service account already has edit_products.
+        # We look for the permission in the role's filter list.
+        role_search = urllib.parse.quote(f"name = {role_name}")
+        found, _ = _kat_get(url, auth, f"/api/v2/roles?search={role_search}&per_page=2", verify_ssl)
+        role_id = None
+        if found and found.get("results"):
+            role_id = found["results"][0]["id"]
+
+        needs_repair = False
+        if role_id:
+            filters_result, _ = _kat_get(url, auth, f"/api/v2/roles/{role_id}/filters?per_page=200", verify_ssl)
+            existing_perms: set[str] = set()
+            if filters_result and filters_result.get("results"):
+                for f in filters_result["results"]:
+                    for p in f.get("permissions", []):
+                        existing_perms.add(p.get("name", ""))
+            needs_repair = "edit_products" not in existing_perms
+        else:
+            # Can't look up the role with service account token — assume repair needed.
+            needs_repair = True
+
+        if needs_repair:
+            print(
+                "  NOTE: The Katello service account role is missing 'edit_products' "
+                "(required for RPM upload).\n"
+                "  Admin credentials are needed once to add this permission."
+            )
+            kat_admin_user = input("  Admin username [admin]: ").strip() or "admin"
+            kat_admin_pass = getpass.getpass("  Admin password: ")
+            admin_auth = _kat_admin_auth(kat_admin_user, kat_admin_pass)
+
+            # Re-resolve role_id with admin auth if needed.
+            if not role_id:
+                found, _ = _kat_get(url, admin_auth, f"/api/v2/roles?search={role_search}&per_page=2", verify_ssl)
+                if found and found.get("results"):
+                    role_id = found["results"][0]["id"]
+
+            if role_id:
+                perms = _kat_find_permission_ids(url, admin_auth, ["edit_products"], verify_ssl)
+                err = _kat_create_filter(url, admin_auth, role_id, perms, verify_ssl)
+                if err:
+                    print(f"  WARNING: Could not add edit_products permission: {err}", file=sys.stderr)
+                else:
+                    print("  Added 'edit_products' to role successfully.")
+                    katello["permissions_v2"] = True
+                    data["katello"] = katello
+                    save_versions(data)
+            else:
+                print("  WARNING: Could not find role to repair. Upload may fail.", file=sys.stderr)
+        else:
+            # Permissions are fine — mark as checked so we skip this next time.
+            katello["permissions_v2"] = True
+            data["katello"] = katello
+            save_versions(data)
 
     return katello
 
