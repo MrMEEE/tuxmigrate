@@ -1161,7 +1161,7 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
     # Step 3: Import the upload into the repository and publish
     # The official Katello API uses PUT for import_uploads, not POST.
     import_payload = {
-        "uploads": [{"id": upload_id, "checksum": checksum, "size": str(file_size)}],
+        "uploads": [{"id": upload_id, "name": filename, "checksum": checksum, "size": str(file_size)}],
         "publish_repository": True,
         "content_type": "rpm",
     }
