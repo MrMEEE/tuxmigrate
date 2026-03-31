@@ -1047,8 +1047,8 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
 
     print(f"\nUploading {filename} to Katello via API...")
 
-    # Step 1: Create an upload request
-    result, err = _kat_post(url, auth, "/katello/api/v2/content_uploads", {}, verify_ssl)
+    # Step 1: Create an upload request (scoped to this repository)
+    result, err = _kat_post(url, auth, f"/katello/api/v2/repositories/{repo_id}/content_uploads", {}, verify_ssl)
     if err or not result:
         print(f"ERROR: Could not create upload request: {err}", file=sys.stderr)
         return
@@ -1071,7 +1071,7 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
         f"Content-Type: application/octet-stream\r\n\r\n"
     ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
 
-    put_url = url.rstrip("/") + f"/katello/api/v2/content_uploads/{upload_id}"
+    put_url = url.rstrip("/") + f"/katello/api/v2/repositories/{repo_id}/content_uploads/{upload_id}"
     req = urllib.request.Request(put_url, data=body, method="PUT")
     req.add_header("Authorization", auth)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
