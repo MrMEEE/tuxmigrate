@@ -515,6 +515,7 @@ def cmd_build(args: argparse.Namespace) -> None:
     # 10. Push to Katello/Satellite if configured
     katello_cfg = data.get("katello", {})
     if katello_cfg.get("enabled"):
+        katello_cfg = _kat_repair_config(data)
         output_dir = _rpm_output_dir(package_name)
         rpm_file = str(
             output_dir / (
@@ -580,6 +581,7 @@ def cmd_rebuild(args: argparse.Namespace) -> None:
         if not katello_cfg.get("enabled"):
             print("WARNING: Katello is not enabled; skipping upload.", file=sys.stderr)
         else:
+            katello_cfg = _kat_repair_config(data)
             output_dir = _rpm_output_dir(package_name)
             rpm_name = (
                 f"{package_name}-{version}-1.x86_64.rpm"
@@ -600,6 +602,8 @@ def cmd_upload(args: argparse.Namespace) -> None:
     package_name = data.get("package_name", "tuxmigrate")
     build_tool   = data.get("build_tool", "fpm")
     version      = args.version
+
+    katello_cfg = _kat_repair_config(data)
 
     output_dir = _rpm_output_dir(package_name)
     rpm_name = (
@@ -943,6 +947,78 @@ def _katello_token(katello_cfg: dict) -> str:
     if not token:
         token = input(f"  Katello Personal Access Token for {katello_cfg['url']}: ").strip()
     return token
+
+
+def _kat_repair_config(data: dict) -> dict:
+    """Fill in missing 'login' and 'repository_id' fields in the katello config block.
+
+    Handles versions.json files created before those fields were introduced.
+    Derives 'login' from 'package_name' (the historical convention) and looks
+    up 'repository_id' via the Katello API when it is absent.
+    Saves the repaired values back to versions.json so the lookup only happens once.
+    Returns the (possibly updated) katello sub-dict.
+    """
+    katello = data.get("katello", {})
+    if not katello.get("enabled"):
+        return katello
+
+    changed = False
+    package_name = data.get("package_name", "tuxmigrate")
+
+    # Derive login from package_name if absent (always been the convention).
+    if not katello.get("login"):
+        katello["login"] = package_name
+        changed = True
+        print(f"  (auto-set katello login = '{package_name}' from package_name)")
+
+    # Look up repository_id from the API if absent.
+    if not katello.get("repository_id"):
+        url        = katello.get("url", "")
+        verify_ssl = katello.get("ssl_verify", True)
+        login      = katello["login"]
+        token      = _katello_token(katello)
+        auth       = _kat_admin_auth(login, token)
+
+        org_name  = katello.get("organization", "")
+        prod_name = katello.get("product", "")
+        repo_name = katello.get("repository", "")
+
+        # Resolve org_id
+        orgs = _kat_api_list(url, auth, "/api/v2/organizations", verify_ssl)
+        org_id = next((o["id"] for o in orgs if o["name"] == org_name), None)
+
+        # Resolve prod_id
+        prod_path = (
+            f"/katello/api/organizations/{org_id}/products"
+            if org_id else "/katello/api/products"
+        )
+        prods = _kat_api_list(url, auth, prod_path, verify_ssl)
+        prod_id = next((p["id"] for p in prods if p["name"] == prod_name), None)
+
+        # Resolve repo_id
+        repo_path = (
+            f"/katello/api/products/{prod_id}/repositories"
+            if prod_id else "/katello/api/repositories"
+        )
+        repos = _kat_api_list(url, auth, repo_path, verify_ssl)
+        repo_id = next((r["id"] for r in repos if r["name"] == repo_name), None)
+
+        if repo_id:
+            katello["repository_id"] = repo_id
+            changed = True
+            print(f"  (auto-resolved katello repository_id = {repo_id} for '{repo_name}')")
+        else:
+            print(
+                f"WARNING: could not resolve repository_id for '{repo_name}' — "
+                "upload may fail.",
+                file=sys.stderr,
+            )
+
+    if changed:
+        data["katello"] = katello
+        save_versions(data)
+
+    return katello
 
 
 def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
