@@ -526,6 +526,41 @@ def cmd_build(args: argparse.Namespace) -> None:
         _push_katello(rpm_file, katello_cfg)
 
 
+def cmd_upload(args: argparse.Namespace) -> None:
+    """Upload the RPM for a specific version to Katello without rebuilding."""
+    data = load_versions()
+    assert data is not None
+    katello_cfg = data.get("katello", {})
+    if not katello_cfg.get("enabled"):
+        die("Katello integration is not enabled. Run 'tuxmigrate status' for details.")
+
+    package_name = data.get("package_name", "tuxmigrate")
+    build_tool   = data.get("build_tool", "fpm")
+    version      = args.version
+
+    output_dir = _rpm_output_dir(package_name)
+    rpm_name = (
+        f"{package_name}-{version}-1.x86_64.rpm"
+        if build_tool == "fpm"
+        else f"{package_name}-{version}-1.noarch.rpm"
+    )
+    rpm_file = output_dir / rpm_name
+
+    if not rpm_file.exists():
+        # Also check root directory for RPMs built before the subdirectory change
+        fallback = Path(rpm_name)
+        if fallback.exists():
+            print(f"Found RPM in current directory (pre-subdirectory build): {fallback}")
+            rpm_file = fallback
+        else:
+            die(
+                f"RPM not found: {rpm_file}\n"
+                f"Run 'tuxmigrate build' to produce the RPM first."
+            )
+
+    _push_katello(str(rpm_file), katello_cfg)
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """Show current version and registered playbooks."""
     data = load_versions()
@@ -1099,6 +1134,18 @@ def main() -> None:
         help="Show current version and pending changes.",
     )
     status_p.set_defaults(func=cmd_status)
+
+    # upload
+    upload_p = sub.add_parser(
+        "upload",
+        help="Upload the RPM for a specific version to Katello/Satellite.",
+    )
+    upload_p.add_argument(
+        "version",
+        metavar="VERSION",
+        help="Version to upload, e.g. 1.0.3",
+    )
+    upload_p.set_defaults(func=cmd_upload)
 
     # remove
     remove_p = sub.add_parser(
