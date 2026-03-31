@@ -515,10 +515,13 @@ def cmd_build(args: argparse.Namespace) -> None:
     # 10. Push to Katello/Satellite if configured
     katello_cfg = data.get("katello", {})
     if katello_cfg.get("enabled"):
-        rpm_file = (
-            f"{package_name}-{new_version}-1.x86_64.rpm"
-            if build_tool == "fpm"
-            else f"{package_name}-{new_version}-1.noarch.rpm"
+        output_dir = _rpm_output_dir(package_name)
+        rpm_file = str(
+            output_dir / (
+                f"{package_name}-{new_version}-1.x86_64.rpm"
+                if build_tool == "fpm"
+                else f"{package_name}-{new_version}-1.noarch.rpm"
+            )
         )
         _push_katello(rpm_file, katello_cfg)
 
@@ -575,6 +578,11 @@ def _rpm_role_path(package_name: str) -> str:
 
 def _rpm_site_yml_path(package_name: str) -> str:
     return f"/usr/share/{package_name}/site.yml"
+
+
+def _rpm_output_dir(package_name: str) -> Path:
+    """Local directory where built RPMs are stored: ./<package_name>-rpms/"""
+    return Path(f"{package_name}-rpms")
 
 
 def _print_install_hint(rpm_file: str) -> None:
@@ -926,6 +934,8 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
 
 
 def _build_fpm(package_name: str, version: str, maintainer: str, description: str) -> bool:
+    output_dir = _rpm_output_dir(package_name)
+    output_dir.mkdir(exist_ok=True)
     cmd = [
         "fpm",
         "-s", "dir",
@@ -937,6 +947,7 @@ def _build_fpm(package_name: str, version: str, maintainer: str, description: st
         "--description", description,
         "--rpm-summary", description,
         "--force",
+        "--package", str(output_dir),
         f"{ROLE_DIR}/={_rpm_role_path(package_name)}/",
         f"{SITE_YML}={_rpm_site_yml_path(package_name)}",
     ]
@@ -944,7 +955,7 @@ def _build_fpm(package_name: str, version: str, maintainer: str, description: st
     if subprocess.run(cmd).returncode != 0:
         print("ERROR: fpm failed. Check the output above for details.", file=sys.stderr)
         return False
-    _print_install_hint(f"{package_name}-{version}-1.x86_64.rpm")
+    _print_install_hint(str(output_dir / f"{package_name}-{version}-1.x86_64.rpm"))
     return True
 
 
@@ -961,9 +972,13 @@ def _build_rpmbuild(
     abs_role_dir = project_root / ROLE_DIR
     abs_site_yml = project_root / SITE_YML
 
+    output_dir = _rpm_output_dir(package_name)
+    output_dir.mkdir(exist_ok=True)
+    abs_output_dir = (project_root / output_dir).resolve()
+
     changelog_date = datetime.datetime.now().strftime("%a %b %d %Y")
 
-    spec_content = f"""%define _rpmdir %(pwd)
+    spec_content = f"""%define _rpmdir {abs_output_dir}
 
 Name:        {package_name}
 Version:     {version}
@@ -1012,7 +1027,7 @@ bash {install_dir}/{POST_INSTALL_SCRIPT}
     if subprocess.run(cmd).returncode != 0:
         print("ERROR: rpmbuild failed. Check the output above for details.", file=sys.stderr)
         return False
-    _print_install_hint(f"{package_name}-{version}-1.noarch.rpm")
+    _print_install_hint(str(output_dir / f"{package_name}-{version}-1.noarch.rpm"))
     return True
 
 

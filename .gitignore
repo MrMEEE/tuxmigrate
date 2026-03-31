@@ -1,5 +1,6 @@
 # Built RPMs
 *.rpm
+*-rpms/
 
 # Generated on first build - contains local config and credentials, not meant for version control
 config.json
