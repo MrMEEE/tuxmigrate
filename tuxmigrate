@@ -504,7 +504,8 @@ def _kat_request(
     req.add_header("Accept", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=30, context=_kat_ssl_ctx(verify_ssl)) as resp:
-            return json.loads(resp.read().decode()), ""
+            body = resp.read().decode()
+            return json.loads(body) if body else {}, ""
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read().decode()
@@ -651,19 +652,30 @@ def _kat_create_pat(
             _, del_err = _kat_request(url, admin_auth, "DELETE",
                                       f"{path}/{pat_id}", verify_ssl=verify_ssl)
             if del_err:
-                return None, f"Could not delete existing PAT '{token_name}': {del_err}"
-            # Wait for deletion to be reflected before recreating (avoid race condition).
-            for attempt in range(6):
+                print(f"    WARNING: DELETE returned error: {del_err}", file=sys.stderr)
+            # Wait up to 6 s for deletion to propagate.
+            deleted = False
+            for _ in range(6):
                 time.sleep(1)
                 check, _ = _kat_get(url, admin_auth, path + "?per_page=200", verify_ssl)
                 check_pats = (
                     check.get("results", []) if isinstance(check, dict) else check or []
                 ) if check else []
                 if not any(p.get("name") == token_name for p in check_pats):
+                    deleted = True
                     break
+            if deleted:
+                result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
             else:
-                return None, f"PAT '{token_name}' still present after DELETE — Satellite did not remove it"
-            result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
+                # Satellite did not remove the PAT — fall back to a unique name.
+                unique_name = token_name + "-" + secrets.token_hex(4)
+                print(f"    (old PAT could not be removed; creating '{unique_name}' instead)",
+                      file=sys.stderr)
+                result, err = _kat_post(
+                    url, admin_auth, path,
+                    {"personal_access_token": {"name": unique_name}},
+                    verify_ssl,
+                )
         if err:
             return None, err
     token_val = result.get("value") or result.get("token", "")
