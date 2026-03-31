@@ -688,6 +688,24 @@ def _rpm_output_dir(package_name: str) -> Path:
     return Path(f"{package_name}-rpms")
 
 
+def _generate_site_yml(package_name: str) -> None:
+    """Write site.yml with the correct role path for package_name."""
+    install_role = _rpm_role_path(package_name)
+    content = f"""---
+# Applied to localhost by the RPM post-install script.
+# Managed by tuxmigrate - do not edit manually.
+- name: Apply {package_name} configuration changes
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: {install_role}
+"""
+    Path(SITE_YML).write_text(content)
+
+
 def _generate_post_install(package_name: str) -> None:
     """Write post-install.sh with the correct install path for package_name."""
     install_dir = f"/usr/share/{package_name}"
@@ -1203,6 +1221,7 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
 
 
 def _build_fpm(package_name: str, version: str, maintainer: str, description: str) -> bool:
+    _generate_site_yml(package_name)
     _generate_post_install(package_name)
     output_dir = _rpm_output_dir(package_name)
     output_dir.mkdir(exist_ok=True)
@@ -1233,6 +1252,7 @@ def _build_rpmbuild(
     package_name: str, version: str, maintainer: str, description: str
 ) -> bool:
     """Generate a minimal .spec file and invoke rpmbuild."""
+    _generate_site_yml(package_name)
     _generate_post_install(package_name)
     install_role = _rpm_role_path(package_name)
     install_site = _rpm_site_yml_path(package_name)
