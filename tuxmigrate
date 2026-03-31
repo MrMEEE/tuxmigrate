@@ -161,8 +161,11 @@ def ensure_config(args: argparse.Namespace) -> None:
             print(f"  Token created and stored in {VERSIONS_FILE} (git-ignored).")
             print("  KATELLO_TOKEN env var overrides the stored token at build time.\n")
 
+            # Foreman PATs authenticate with Basic auth (login:token_value), not Bearer.
+            kat_pat_auth = _kat_admin_auth(svc_login, kat_token)
+
             # Use the new service account token to select org / product / repo
-            orgs = _kat_api_list(kat_url, kat_token, "/api/v2/organizations", verify_ssl=kat_ssl)
+            orgs = _kat_api_list(kat_url, kat_pat_auth, "/api/v2/organizations", verify_ssl=kat_ssl)
             kat_org = _kat_pick("Organization", orgs, "Default Organization")
 
             org_id = next((o["id"] for o in orgs if o["name"] == kat_org), None)
@@ -170,7 +173,7 @@ def ensure_config(args: argparse.Namespace) -> None:
                 f"/katello/api/organizations/{org_id}/products"
                 if org_id else "/katello/api/products"
             )
-            prods = _kat_api_list(kat_url, kat_token, prod_path, verify_ssl=kat_ssl)
+            prods = _kat_api_list(kat_url, kat_pat_auth, prod_path, verify_ssl=kat_ssl)
             kat_prod = _kat_pick("Product", prods, "Custom RPMs")
 
             prod_id = next((p["id"] for p in prods if p["name"] == kat_prod), None)
@@ -178,7 +181,7 @@ def ensure_config(args: argparse.Namespace) -> None:
                 f"/katello/api/products/{prod_id}/repositories"
                 if prod_id else "/katello/api/repositories"
             )
-            repos = _kat_api_list(kat_url, kat_token, repo_path, verify_ssl=kat_ssl)
+            repos = _kat_api_list(kat_url, kat_pat_auth, repo_path, verify_ssl=kat_ssl)
             kat_repo = _kat_pick("Repository", repos, package_name)
 
             katello = {
@@ -682,9 +685,9 @@ def _kat_create_pat(
     return token_val or None, ""
 
 
-def _kat_api_list(url: str, token: str, path: str, verify_ssl: bool = True) -> list[dict]:
-    """Fetch a Katello API list using a Bearer token. Returns [] on failure."""
-    result, err = _kat_get(url, f"Bearer {token}", path + "?per_page=200", verify_ssl)
+def _kat_api_list(url: str, auth: str, path: str, verify_ssl: bool = True) -> list[dict]:
+    """Fetch a Katello API list using the given auth header value. Returns [] on failure."""
+    result, err = _kat_get(url, auth, path + "?per_page=200", verify_ssl)
     if err:
         print(f"    WARNING: could not fetch {path}: {err}", file=sys.stderr)
         return []
