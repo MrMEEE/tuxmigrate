@@ -1339,7 +1339,7 @@ def _build_rpmbuild(
 
 Name:        {package_name}
 Version:     {version}
-Release:     1%{{?dist}}
+Release:     1
 Summary:     {description}
 License:     MIT
 BuildArch:   noarch
@@ -1380,6 +1380,7 @@ bash {install_dir}/{POST_INSTALL_SCRIPT}
         "rpmbuild",
         "--define", f"_topdir {Path('.').resolve()}",
         "--define", f"_rpmfilename {package_name}-{version}-1.noarch.rpm",
+        "--define", "dist %{nil}",
         "-bb", str(spec_file),
     ]
     print(f"Running: {' '.join(cmd)}\n")
