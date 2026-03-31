@@ -20,6 +20,7 @@ import ssl
 import string
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -651,6 +652,17 @@ def _kat_create_pat(
                                       f"{path}/{pat_id}", verify_ssl=verify_ssl)
             if del_err:
                 return None, f"Could not delete existing PAT '{token_name}': {del_err}"
+            # Wait for deletion to be reflected before recreating (avoid race condition).
+            for attempt in range(6):
+                time.sleep(1)
+                check, _ = _kat_get(url, admin_auth, path + "?per_page=200", verify_ssl)
+                check_pats = (
+                    check.get("results", []) if isinstance(check, dict) else check or []
+                ) if check else []
+                if not any(p.get("name") == token_name for p in check_pats):
+                    break
+            else:
+                return None, f"PAT '{token_name}' still present after DELETE — Satellite did not remove it"
             result, err = _kat_post(url, admin_auth, path, payload, verify_ssl)
         if err:
             return None, err
