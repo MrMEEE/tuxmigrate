@@ -37,6 +37,8 @@ CHANGES_DIR = "changes"
 ROLE_DIR = "role"
 ROLE_PLAYBOOKS_DIR = os.path.join(ROLE_DIR, "playbooks")
 ROLE_TASKS_DIR = os.path.join(ROLE_DIR, "tasks")
+ROLE_TEMPLATES_DIR = os.path.join(ROLE_DIR, "templates")
+ROLE_FILES_DIR = os.path.join(ROLE_DIR, "files")
 SITE_YML = "site.yml"
 POST_INSTALL_SCRIPT = "post-install.sh"
 FACTS_DIR = "/etc/ansible/facts.d"
@@ -454,29 +456,57 @@ def _lint_files(files: list[Path]) -> bool:
     return result.returncode == 0
 
 
+def _update_src_references(playbook_path: Path, old_name: str, new_name: str) -> bool:
+    """Replace ``src: <old_name>`` with ``src: <new_name>`` in playbook_path.
+
+    Only modifies ``src:`` lines.  All other keys that reference paths on the
+    managed host — ``dest:``, ``path:``, ``creates:``, ``removes:``, etc. —
+    are left untouched because the regex anchors strictly on ``src:``.
+    Handles optional path prefixes and quoted/unquoted values.
+    Returns True if any replacement was made.
+    """
+    content = playbook_path.read_text()
+    pattern = re.compile(
+        r'(^\s+src:\s+["\']?)(?:[^"\']*/)?' + re.escape(old_name) + r'(["\']?\s*(?:#.*)?)$',
+        re.MULTILINE,
+    )
+    new_content = pattern.sub(r'\g<1>' + new_name + r'\g<2>', content)
+    if new_content != content:
+        playbook_path.write_text(new_content)
+        return True
+    return False
+
+
 def cmd_build(args: argparse.Namespace) -> None:
     """Increment version, absorb changes into role, rebuild RPM."""
 
-    # 1. Discover pending change files
+    # 1. Discover pending change files, categorised by type.
     changes_path = Path(CHANGES_DIR)
-    pending = sorted(
+    all_pending = sorted(
         p for p in changes_path.iterdir()
-        if p.suffix in {".yml", ".yaml"} and p.is_file()
+        if p.is_file() and not p.name.startswith(".")
     )
+    pending_playbooks = [p for p in all_pending if p.suffix in {".yml", ".yaml"}]
+    pending_templates = [p for p in all_pending if p.suffix == ".j2"]
+    pending_files     = [p for p in all_pending if p.suffix not in {".yml", ".yaml", ".j2"}]
 
-    if not pending:
+    if not pending_playbooks:
         die(
             f"No YAML task files found in '{CHANGES_DIR}/'. "
             "Add at least one task file before building."
         )
 
-    print(f"Found {len(pending)} pending change(s):")
-    for p in pending:
-        print(f"  {p.name}")
+    print(f"Found {len(all_pending)} pending change(s):")
+    for p in pending_playbooks:
+        print(f"  [playbook]  {p.name}")
+    for p in pending_templates:
+        print(f"  [template]  {p.name}")
+    for p in pending_files:
+        print(f"  [file]      {p.name}")
 
-    # 2. Lint all pending files before touching anything.
+    # 2. Lint YAML playbooks before touching anything.
     _ensure_lint_venv()
-    if not _lint_files(pending):
+    if not _lint_files(pending_playbooks):
         die("ansible-lint reported errors. Fix them before building.")
 
     # 3. Load state
@@ -513,16 +543,50 @@ def cmd_build(args: argparse.Namespace) -> None:
     playbooks_path = Path(ROLE_PLAYBOOKS_DIR)
     playbooks_path.mkdir(parents=True, exist_ok=True)
 
-    new_entries: list[str] = []
-    for idx, src in enumerate(pending, start=1):
+    # Pre-compute (src, dest, category) for all pending files.
+    # A single shared index keeps the versioned prefix unique across all types.
+    all_moves: list[tuple[Path, Path, str]] = []
+    for idx, src in enumerate(all_pending, start=1):
         dest_name = f"{new_version}_{idx:02d}_{src.name}"
-        dest = playbooks_path / dest_name
-        shutil.move(str(src), str(dest))
-        if _normalize_playbook_if_needed(dest):
-            print(f"  Converted full playbook to task file: {src.name} -> role/playbooks/{dest_name}")
+        if src.suffix in {".yml", ".yaml"}:
+            dest = playbooks_path / dest_name
+            cat  = "playbook"
+        elif src.suffix == ".j2":
+            dest = Path(ROLE_TEMPLATES_DIR) / dest_name
+            cat  = "template"
         else:
-            print(f"  Moved: {src.name} -> role/playbooks/{dest_name}")
-        new_entries.append(dest_name)
+            dest = Path(ROLE_FILES_DIR) / dest_name
+            cat  = "file"
+        all_moves.append((src, dest, cat))
+
+    # Update src: references in pending playbooks for the renamed templates/files.
+    # Only the source path changes; dest: lines (install paths) are left untouched.
+    non_playbook_renames = [
+        (src.name, dest.name)
+        for src, dest, cat in all_moves
+        if cat != "playbook"
+    ]
+    if non_playbook_renames:
+        pending_playbook_paths = [src for src, _, cat in all_moves if cat == "playbook"]
+        for old_name, new_name in non_playbook_renames:
+            for pb_path in pending_playbook_paths:
+                if _update_src_references(pb_path, old_name, new_name):
+                    print(f"  Updated src reference in {pb_path.name}: {old_name!r} -> {new_name!r}")
+
+    new_entries: list[str] = []
+    for src, dest, cat in all_moves:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+        if cat == "playbook":
+            if _normalize_playbook_if_needed(dest):
+                print(f"  Converted full playbook to task file: {src.name} -> role/playbooks/{dest.name}")
+            else:
+                print(f"  Moved: {src.name} -> role/playbooks/{dest.name}")
+            new_entries.append(dest.name)
+        elif cat == "template":
+            print(f"  Moved: {src.name} -> role/templates/{dest.name}")
+        else:
+            print(f"  Moved: {src.name} -> role/files/{dest.name}")
 
     # 7. Update versions.json
     data["version"]      = new_version
@@ -549,11 +613,21 @@ def cmd_build(args: argparse.Namespace) -> None:
 
     if not success:
         print("\nBuild failed — rolling back changes...", file=sys.stderr)
-        for src, dest_name in zip(pending, new_entries):
-            dest = playbooks_path / dest_name
+        # Undo src reference updates in moved playbooks before moving them back.
+        if non_playbook_renames:
+            for src, dest, cat in all_moves:
+                if cat == "playbook" and dest.exists():
+                    for old_name, new_name in non_playbook_renames:
+                        _update_src_references(dest, new_name, old_name)
+        for src, dest, cat in all_moves:
             if dest.exists():
+                subdir = {
+                    "playbook": ROLE_PLAYBOOKS_DIR,
+                    "template": ROLE_TEMPLATES_DIR,
+                    "file":     ROLE_FILES_DIR,
+                }[cat]
                 shutil.move(str(dest), str(src))
-                print(f"  Restored: {dest_name} -> {CHANGES_DIR}/{src.name}")
+                print(f"  Restored: {subdir}/{dest.name} -> {CHANGES_DIR}/{src.name}")
         data["version"]   = old_version
         data["playbooks"] = old_playbooks
         save_versions(data)
@@ -722,15 +796,21 @@ def cmd_status(args: argparse.Namespace) -> None:
             print(f"  {pb}")
 
     changes_path = Path(CHANGES_DIR)
-    pending = sorted(
-        p.name
-        for p in changes_path.iterdir()
-        if p.suffix in {".yml", ".yaml"} and p.is_file()
+    all_pending = sorted(
+        p for p in changes_path.iterdir()
+        if p.is_file() and not p.name.startswith(".")
     )
-    if pending:
-        print(f"\nPending changes ({len(pending)}) - ready for next build:")
-        for name in pending:
-            print(f"  {name}")
+    pending_playbooks = [p for p in all_pending if p.suffix in {".yml", ".yaml"}]
+    pending_templates = [p for p in all_pending if p.suffix == ".j2"]
+    pending_other     = [p for p in all_pending if p.suffix not in {".yml", ".yaml", ".j2"}]
+    if all_pending:
+        print(f"\nPending changes ({len(all_pending)}) - ready for next build:")
+        for p in pending_playbooks:
+            print(f"  [playbook]  {p.name}")
+        for p in pending_templates:
+            print(f"  [template]  {p.name}")
+        for p in pending_other:
+            print(f"  [file]      {p.name}")
     else:
         print("\nNo pending changes.")
 
