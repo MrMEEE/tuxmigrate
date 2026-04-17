@@ -1421,7 +1421,6 @@ def _build_fpm(
         "-t", "rpm",
         "-n", package_name,
         "-v", version,
-        "--after-install", POST_INSTALL_SCRIPT,
         "--maintainer", maintainer,
         "--description", description,
         "--rpm-summary", description,
@@ -1491,9 +1490,6 @@ chmod +x %{{buildroot}}{install_dir}/{POST_INSTALL_SCRIPT}
 
 %files
 %{{_usr}}/share/{package_name}/
-
-%post
-bash {install_dir}/{POST_INSTALL_SCRIPT}
 
 %changelog
 * {changelog_date} {maintainer} - {version}-1
