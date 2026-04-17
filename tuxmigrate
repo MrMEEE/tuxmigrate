@@ -93,6 +93,33 @@ def save_versions(data: dict) -> None:
         fh.write("\n")
 
 
+def _tuxpatch_requirement(require_tuxpatch: object) -> str | None:
+    """Return an RPM dependency expression for tuxpatch, or None if disabled.
+
+    Accepted values:
+      - False / None: disable tuxpatch requirement
+      - True: require tuxpatch (any version)
+      - "<version>": require tuxpatch >= <version>
+    """
+    if require_tuxpatch is None or require_tuxpatch is False:
+        return None
+    if require_tuxpatch is True:
+        return "tuxpatch"
+    if isinstance(require_tuxpatch, str):
+        version = require_tuxpatch.strip()
+        if not version:
+            return None
+        if re.search(r"\s", version):
+            die(
+                "Invalid 'require_tuxpatch' value in versions.json: version must not contain spaces."
+            )
+        return f"tuxpatch >= {version}"
+    die(
+        "Invalid 'require_tuxpatch' value in versions.json. "
+        "Use false, true, or a version string (for example: \"1.2.3\")."
+    )
+
+
 def ensure_config(args: argparse.Namespace) -> None:
     """Run the interactive first-time setup if versions.json does not exist yet."""
     if Path(VERSIONS_FILE).exists():
@@ -208,6 +235,7 @@ def ensure_config(args: argparse.Namespace) -> None:
         "package_name": package_name,
         "maintainer": maintainer,
         "description": description,
+        "require_tuxpatch": False,
         "build_tool": build_tool,
         "playbooks": [],
         "katello": katello,
@@ -519,7 +547,9 @@ def cmd_build(args: argparse.Namespace) -> None:
     package_name = args.package_name or data.get("package_name", "tuxmigrate")
     maintainer   = args.maintainer   or data.get("maintainer",   "tuxmigrate")
     description  = args.description  or data.get("description",  "TuxMigrate configuration management")
+    require_tuxpatch = data.get("require_tuxpatch", False)
     build_tool   = args.build_tool   or data.get("build_tool",   "fpm")
+    tuxpatch_requires = _tuxpatch_requirement(require_tuxpatch)
 
     if build_tool not in SUPPORTED_BUILD_TOOLS:
         die(f"Unknown build_tool '{build_tool}' in {VERSIONS_FILE}. Choose from: {', '.join(SUPPORTED_BUILD_TOOLS)}.")
@@ -593,6 +623,7 @@ def cmd_build(args: argparse.Namespace) -> None:
     data["package_name"] = package_name
     data["maintainer"]   = maintainer
     data["description"]  = description
+    data["require_tuxpatch"] = require_tuxpatch
     data["build_tool"]   = build_tool
     data.setdefault("playbooks", []).extend(new_entries)
     save_versions(data)
@@ -607,9 +638,9 @@ def cmd_build(args: argparse.Namespace) -> None:
 
     # 9. Build the RPM; roll back everything on failure.
     if build_tool == "fpm":
-        success = _build_fpm(package_name, new_version, maintainer, description)
+        success = _build_fpm(package_name, new_version, maintainer, description, tuxpatch_requires)
     else:
-        success = _build_rpmbuild(package_name, new_version, maintainer, description)
+        success = _build_rpmbuild(package_name, new_version, maintainer, description, tuxpatch_requires)
 
     if not success:
         print("\nBuild failed — rolling back changes...", file=sys.stderr)
@@ -662,8 +693,10 @@ def cmd_rebuild(args: argparse.Namespace) -> None:
     package_name = data.get("package_name", "tuxmigrate")
     maintainer   = data.get("maintainer",   "tuxmigrate")
     description  = data.get("description",  "TuxMigrate configuration management")
+    require_tuxpatch = data.get("require_tuxpatch", False)
     build_tool   = data.get("build_tool",   "fpm")
     version      = args.version
+    tuxpatch_requires = _tuxpatch_requirement(require_tuxpatch)
 
     # Verify the version exists in recorded history
     all_playbooks = data.get("playbooks", [])
@@ -709,9 +742,9 @@ def cmd_rebuild(args: argparse.Namespace) -> None:
     print(f"Rebuilding RPM for version {version} (build tool: {build_tool})...")
 
     if build_tool == "fpm":
-        success = _build_fpm(package_name, version, maintainer, description)
+        success = _build_fpm(package_name, version, maintainer, description, tuxpatch_requires)
     else:
-        success = _build_rpmbuild(package_name, version, maintainer, description)
+        success = _build_rpmbuild(package_name, version, maintainer, description, tuxpatch_requires)
 
     if not success:
         die("Rebuild failed. Check the output above for details.")
@@ -776,6 +809,12 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Package    : {data.get('package_name', 'tuxmigrate')}")
     print(f"Version    : {data['version']}")
     print(f"Build tool : {data.get('build_tool', 'fpm')}")
+    require_tuxpatch = data.get("require_tuxpatch", False)
+    tuxpatch_requires = _tuxpatch_requirement(require_tuxpatch)
+    if tuxpatch_requires:
+        print(f"Tuxpatch   : required ({tuxpatch_requires})")
+    else:
+        print("Tuxpatch   : not required")
     katello = data.get("katello", {})
     if katello.get("enabled"):
         print(f"Katello URL: {katello.get('url')}")
@@ -1365,7 +1404,13 @@ def _push_katello(rpm_file: str, katello_cfg: dict) -> None:
         print(f"  Uploaded and published {filename} to Katello repository.")
 
 
-def _build_fpm(package_name: str, version: str, maintainer: str, description: str) -> bool:
+def _build_fpm(
+    package_name: str,
+    version: str,
+    maintainer: str,
+    description: str,
+    tuxpatch_requires: str | None,
+) -> bool:
     _generate_site_yml(package_name)
     _generate_post_install(package_name)
     output_dir = _rpm_output_dir(package_name)
@@ -1385,6 +1430,8 @@ def _build_fpm(package_name: str, version: str, maintainer: str, description: st
         f"{ROLE_DIR}/={_rpm_role_path(package_name)}/",
         f"{SITE_YML}={_rpm_site_yml_path(package_name)}",
     ]
+    if tuxpatch_requires:
+        cmd.extend(["--depends", tuxpatch_requires])
     print(f"\nRunning: {' '.join(cmd)}\n")
     if subprocess.run(cmd).returncode != 0:
         print("ERROR: fpm failed. Check the output above for details.", file=sys.stderr)
@@ -1394,7 +1441,11 @@ def _build_fpm(package_name: str, version: str, maintainer: str, description: st
 
 
 def _build_rpmbuild(
-    package_name: str, version: str, maintainer: str, description: str
+    package_name: str,
+    version: str,
+    maintainer: str,
+    description: str,
+    tuxpatch_requires: str | None,
 ) -> bool:
     """Generate a minimal .spec file and invoke rpmbuild."""
     _generate_site_yml(package_name)
@@ -1414,6 +1465,7 @@ def _build_rpmbuild(
     abs_output_dir = (project_root / output_dir).resolve()
 
     changelog_date = datetime.datetime.now().strftime("%a %b %d %Y")
+    requires_line = f"Requires:    {tuxpatch_requires}\n" if tuxpatch_requires else ""
 
     spec_content = f"""%define _rpmdir {abs_output_dir}
 
@@ -1424,6 +1476,7 @@ Summary:     {description}
 License:     MIT
 BuildArch:   noarch
 Packager:    {maintainer}
+{requires_line}
 
 %description
 {description}

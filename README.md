@@ -135,6 +135,7 @@ To upload RPMs automatically after each successful build, add a `satellite` sect
     "package_name": "tuxmigrate",
     "maintainer": "tuxmigrate",
     "description": "TuxMigrate configuration management",
+    "require_tuxpatch": false,
     "builder": "fpm",
     "playbooks": [],
     "satellite": {
@@ -212,6 +213,10 @@ Example (`tuxmigrate_1_1_0_01_install_vim.fact`):
 ## Tips
 
 - **Re-running** `tuxmigrate build` with nothing in `changes/` will error — this prevents accidental empty RPMs.
+- Set `require_tuxpatch` in `versions.json` to control RPM dependency metadata:
+    - `false` (default): no tuxpatch dependency
+    - `true`: adds `Requires: tuxpatch`
+    - `"1.2.3"`: adds `Requires: tuxpatch >= 1.2.3`
 - Edit **`config.json`** directly to change package name, maintainer, builder, or Satellite/Katello upload settings.
 - `config.json` is created automatically on the first `tuxmigrate build` and is git-ignored.
 - The `role/` directory is committed to version control; `*.rpm` files are git-ignored.
