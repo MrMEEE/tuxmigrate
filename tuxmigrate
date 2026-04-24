@@ -387,63 +387,54 @@ def generate_tasks_main(playbooks: list[str]) -> str:
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
-    """Remove a version or a specific playbook from the role, moving files back to changes/."""
+    """Remove a version from the role, moving all its files back to changes/."""
     data = load_versions()
     assert data is not None
 
+    ver = args.version
     playbooks: list[str] = data.get("playbooks", [])
-    playbooks_path = Path(ROLE_PLAYBOOKS_DIR)
     changes_path = Path(CHANGES_DIR)
     changes_path.mkdir(exist_ok=True)
 
-    if args.playbook:
-        # Remove a single named playbook (match by original name or full stored name).
-        target = args.playbook
-        matched = [p for p in playbooks if p == target or p.endswith(f"_{target}")]
-        if not matched:
-            die(f"No playbook matching '{target}' found in the role.\n"
-                f"Stored playbooks: {', '.join(playbooks) or '(none)'}")
-        if len(matched) > 1:
-            die(f"Ambiguous match for '{target}': {', '.join(matched)}\n"
-                f"Use the full stored filename.")
-        stored_name = matched[0]
-        src = playbooks_path / stored_name
-        # Restore to changes/ using the original filename (strip version prefix).
-        original = "_".join(stored_name.split("_")[2:])  # strip "VERSION_NN_"
+    prefix = f"{ver}_"
+
+    # Collect all files for this version across playbooks, templates, and files dirs.
+    candidates: list[tuple[Path, str]] = []  # (src_path, subdir_label)
+
+    for stored_name in playbooks:
+        if stored_name.startswith(prefix):
+            candidates.append((Path(ROLE_PLAYBOOKS_DIR) / stored_name, "role/playbooks"))
+
+    for role_dir, label in [
+        (ROLE_TEMPLATES_DIR, "role/templates"),
+        (ROLE_FILES_DIR,     "role/files"),
+    ]:
+        d = Path(role_dir)
+        if d.is_dir():
+            for f in sorted(d.iterdir()):
+                if f.is_file() and f.name.startswith(prefix):
+                    candidates.append((f, label))
+
+    if not candidates:
+        die(f"No files found for version '{ver}'.\n"
+            f"Stored playbooks: {', '.join(playbooks) or '(none)'}")
+
+    print(f"Removing {len(candidates)} file(s) for version {ver}:")
+    for src, label in candidates:
+        original = "_".join(src.name.split("_")[2:])  # strip "VERSION_NN_"
         dest = changes_path / original
         if src.exists():
             shutil.move(str(src), str(dest))
-            print(f"Moved: role/playbooks/{stored_name} -> {CHANGES_DIR}/{original}")
+            print(f"  Moved: {label}/{src.name} -> {CHANGES_DIR}/{original}")
         else:
-            print(f"WARNING: {src} not found on disk — removing from registry only.", file=sys.stderr)
-        playbooks.remove(stored_name)
+            print(f"  WARNING: {src} not found on disk — removing from registry only.", file=sys.stderr)
 
-    elif args.version:
-        ver = args.version
-        to_remove = [p for p in playbooks if p.startswith(f"{ver}_")]
-        if not to_remove:
-            die(f"No playbooks found for version '{ver}'.\n"
-                f"Stored playbooks: {', '.join(playbooks) or '(none)'}")
-        print(f"Removing {len(to_remove)} playbook(s) for version {ver}:")
-        for stored_name in to_remove:
-            src = playbooks_path / stored_name
-            original = "_".join(stored_name.split("_")[2:])
-            dest = changes_path / original
-            if src.exists():
-                shutil.move(str(src), str(dest))
-                print(f"  Moved: role/playbooks/{stored_name} -> {CHANGES_DIR}/{original}")
-            else:
-                print(f"  WARNING: {src} not found on disk — removing from registry only.", file=sys.stderr)
-            playbooks.remove(stored_name)
-
-    else:
-        die("Specify --version VERSION or --playbook PLAYBOOK_NAME.")
-
-    data["playbooks"] = playbooks
+    # Update registry (playbooks only — templates/files are not tracked there).
+    data["playbooks"] = [p for p in playbooks if not p.startswith(prefix)]
     save_versions(data)
 
     tasks_file = Path(ROLE_TASKS_DIR) / "main.yml"
-    tasks_file.write_text(generate_tasks_main(playbooks))
+    tasks_file.write_text(generate_tasks_main(data["playbooks"]))
     print(f"Regenerated {tasks_file}")
 
 
@@ -1621,18 +1612,12 @@ def main() -> None:
     # remove
     remove_p = sub.add_parser(
         "remove",
-        help="Move a version or specific playbook back to changes/.",
+        help="Move all files for a version back to changes/.",
     )
-    remove_group = remove_p.add_mutually_exclusive_group(required=True)
-    remove_group.add_argument(
-        "--version",
+    remove_p.add_argument(
+        "version",
         metavar="VERSION",
-        help="Remove all playbooks that belong to VERSION (e.g. 1.0.3).",
-    )
-    remove_group.add_argument(
-        "--playbook",
-        metavar="NAME",
-        help="Remove a single playbook by its original or stored filename.",
+        help="Version whose files should be moved back to changes/ (e.g. 1.0.3).",
     )
     remove_p.set_defaults(func=cmd_remove)
 
