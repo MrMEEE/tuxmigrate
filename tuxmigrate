@@ -419,6 +419,21 @@ def cmd_remove(args: argparse.Namespace) -> None:
         die(f"No files found for version '{ver}'.\n"
             f"Stored playbooks: {', '.join(playbooks) or '(none)'}")
 
+    # Build rename map for non-playbook files: stored_name -> original_name.
+    # These names were rewritten into src: lines in the playbooks at build time,
+    # so we need to reverse them in the playbooks before moving anything back.
+    non_playbook_renames = [
+        (src.name, "_".join(src.name.split("_")[2:]))  # (new_name, old_name)
+        for src, label in candidates
+        if label != "role/playbooks"
+    ]
+    if non_playbook_renames:
+        for src, label in candidates:
+            if label == "role/playbooks" and src.exists():
+                for new_name, old_name in non_playbook_renames:
+                    if _update_src_references(src, new_name, old_name):
+                        print(f"  Reversed src reference in {src.name}: {new_name!r} -> {old_name!r}")
+
     print(f"Removing {len(candidates)} file(s) for version {ver}:")
     for src, label in candidates:
         original = "_".join(src.name.split("_")[2:])  # strip "VERSION_NN_"
