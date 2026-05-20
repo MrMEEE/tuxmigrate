@@ -493,31 +493,112 @@ def _lint_files(files: list[Path]) -> bool:
 def _update_src_references(playbook_path: Path, old_name: str, new_name: str) -> bool:
     """Replace references to old_name with new_name in playbook_path.
 
-    Matches two forms:
-    - ``src: <old_name>`` — direct module argument.
-    - ``- <old_name>``   — YAML list items used in ``loop:``, ``with_items:``,
+    Matches two forms per task block:
+    - ``src: <old_name>``  — direct module argument.
+    - ``- <old_name>``     — YAML list items used in ``loop:``, ``with_items:``,
       ``with_fileglob:``, and other ``with_*`` directives.
 
-    All other keys that reference paths on the managed host — ``dest:``,
-    ``path:``, ``creates:``, ``removes:``, etc. — are left untouched because
-    the patterns anchor strictly on ``src:`` or a list-item dash.
-    Handles optional path prefixes and quoted/unquoted values.
+    Conflict handling: when ``{{ item }}`` drives both ``src:`` and a destination
+    key (``dest:``, ``path:``, ``creates:``, ``removes:``) within the same task,
+    simply renaming the loop item would corrupt the destination path.  In that
+    case the item is promoted to an inline dict so the two values can diverge:
+
+        - {src: "<new_name>", dest: "<old_name>"}
+
+    and ``{{ item }}`` is rewritten to ``{{ item.src }}`` / ``{{ item.dest }}``
+    in the respective lines.  The reverse transformation (dict → simple item) is
+    applied symmetrically when called with the versioned name as old_name.
+
+    All other keys are left untouched.
     Returns True if any replacement was made.
     """
-    escaped = re.escape(old_name)
-    tail    = r'(["\']?\s*(?:#.*)?)$'
     content = playbook_path.read_text()
+    if old_name not in content:
+        return False
 
-    # src: <filename>
-    src_pat  = re.compile(r'(^\s+src:\s+["\']?)(?:[^"\']*/)?' + escaped + tail, re.MULTILINE)
-    # - <filename>  (loop / with_* list items)
-    item_pat = re.compile(r'(^\s+-\s+["\']?)(?:[^"\']*/)?' + escaped + tail, re.MULTILINE)
+    escaped_old = re.escape(old_name)
+    escaped_new = re.escape(new_name)
+    _DEST       = r'(?:dest|path|creates|removes)'
+    _TAIL       = r'(["\']?\s*(?:#.*)?)$'
 
-    new_content = src_pat.sub(r'\g<1>' + new_name + r'\g<2>', content)
-    new_content = item_pat.sub(r'\g<1>' + new_name + r'\g<2>', new_content)
+    # Simple-rename patterns.
+    src_pat  = re.compile(r'(^\s+src:\s+["\']?)(?:[^"\']*/)?' + escaped_old + _TAIL, re.MULTILINE)
+    item_pat = re.compile(r'(^\s+-\s+["\']?)(?:[^"\']*/)?' + escaped_old + _TAIL, re.MULTILINE)
 
-    if new_content != content:
-        playbook_path.write_text(new_content)
+    # Dict-item reverse pattern: "{src: old_name, dest: new_name}" (produced by
+    # the forward pass; quotes are optional).
+    dict_pat = re.compile(
+        r'^(\s+)-\s+\{\s*src:\s*["\']?' + escaped_old
+        + r'["\']?\s*,\s*dest:\s*["\']?' + escaped_new + r'["\']?\s*\}' + _TAIL,
+        re.MULTILINE,
+    )
+
+    # Split content on top-level task boundaries (lines that begin with "- ").
+    # Indented list items like "    - file.j2" do NOT match because ^ lands
+    # before the leading spaces, so the lookahead "- " fails for them.
+    parts     = re.split(r'^(?=- )', content, flags=re.MULTILINE)
+    new_parts = []
+    changed   = False
+
+    for part in parts:
+        has_item = bool(item_pat.search(part))
+        has_dict = bool(dict_pat.search(part))
+
+        if not has_item and not has_dict:
+            # No loop reference — only rename direct src: lines.
+            new_part = src_pat.sub(r'\g<1>' + new_name + r'\g<2>', part)
+
+        elif has_dict:
+            # Reverse: dict item → simple list item, restore {{ item }}.
+            new_part = dict_pat.sub(r'\1- ' + new_name + r'\2', part)
+            new_part = re.sub(
+                r'(^\s+src:\s+["\']?.*?)\{\{\s*item\.src\s*\}\}',
+                r'\1{{ item }}', new_part, flags=re.MULTILINE,
+            )
+            new_part = re.sub(
+                r'(^\s+' + _DEST + r':\s+["\']?.*?)\{\{\s*item\.dest\s*\}\}',
+                r'\1{{ item }}', new_part, flags=re.MULTILINE,
+            )
+
+        else:
+            # old_name is a plain loop item — check for src+dest {{ item }} conflict.
+            item_in_src  = bool(re.search(
+                r'^\s+src:\s+["\']?.*\{\{\s*item\s*\}\}', part, re.MULTILINE))
+            item_in_dest = bool(re.search(
+                r'^\s+' + _DEST + r':\s+["\']?.*\{\{\s*item\s*\}\}', part, re.MULTILINE))
+
+            if item_in_src and item_in_dest:
+                # Conflict: promote loop item to {src:, dest:} dict.
+                loop_re = re.compile(
+                    r'^(\s+)-\s+(["\']?)(?:[^"\']*/)?' + escaped_old + r'\2' + _TAIL,
+                    re.MULTILINE,
+                )
+                new_part = loop_re.sub(
+                    lambda m: (
+                        f'{m.group(1)}- {{src: "{new_name}", dest: "{old_name}"}}{m.group(3)}'
+                    ),
+                    part,
+                )
+                new_part = re.sub(
+                    r'(^\s+src:\s+["\']?.*?)\{\{\s*item\s*\}\}',
+                    r'\1{{ item.src }}', new_part, flags=re.MULTILINE,
+                )
+                new_part = re.sub(
+                    r'(^\s+' + _DEST + r':\s+["\']?.*?)\{\{\s*item\s*\}\}',
+                    r'\1{{ item.dest }}', new_part, flags=re.MULTILINE,
+                )
+                # Also rename any direct src: old_name in the same block.
+                new_part = src_pat.sub(r'\g<1>' + new_name + r'\g<2>', new_part)
+            else:
+                # No conflict — simple rename.
+                new_part = src_pat.sub(r'\g<1>' + new_name + r'\g<2>', part)
+                new_part = item_pat.sub(r'\g<1>' + new_name + r'\g<2>', new_part)
+
+        new_parts.append(new_part)
+        changed = changed or (new_part != part)
+
+    if changed:
+        playbook_path.write_text(''.join(new_parts))
         return True
     return False
 
