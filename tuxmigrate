@@ -491,20 +491,31 @@ def _lint_files(files: list[Path]) -> bool:
 
 
 def _update_src_references(playbook_path: Path, old_name: str, new_name: str) -> bool:
-    """Replace ``src: <old_name>`` with ``src: <new_name>`` in playbook_path.
+    """Replace references to old_name with new_name in playbook_path.
 
-    Only modifies ``src:`` lines.  All other keys that reference paths on the
-    managed host — ``dest:``, ``path:``, ``creates:``, ``removes:``, etc. —
-    are left untouched because the regex anchors strictly on ``src:``.
+    Matches two forms:
+    - ``src: <old_name>`` — direct module argument.
+    - ``- <old_name>``   — YAML list items used in ``loop:``, ``with_items:``,
+      ``with_fileglob:``, and other ``with_*`` directives.
+
+    All other keys that reference paths on the managed host — ``dest:``,
+    ``path:``, ``creates:``, ``removes:``, etc. — are left untouched because
+    the patterns anchor strictly on ``src:`` or a list-item dash.
     Handles optional path prefixes and quoted/unquoted values.
     Returns True if any replacement was made.
     """
+    escaped = re.escape(old_name)
+    tail    = r'(["\']?\s*(?:#.*)?)$'
     content = playbook_path.read_text()
-    pattern = re.compile(
-        r'(^\s+src:\s+["\']?)(?:[^"\']*/)?' + re.escape(old_name) + r'(["\']?\s*(?:#.*)?)$',
-        re.MULTILINE,
-    )
-    new_content = pattern.sub(r'\g<1>' + new_name + r'\g<2>', content)
+
+    # src: <filename>
+    src_pat  = re.compile(r'(^\s+src:\s+["\']?)(?:[^"\']*/)?' + escaped + tail, re.MULTILINE)
+    # - <filename>  (loop / with_* list items)
+    item_pat = re.compile(r'(^\s+-\s+["\']?)(?:[^"\']*/)?' + escaped + tail, re.MULTILINE)
+
+    new_content = src_pat.sub(r'\g<1>' + new_name + r'\g<2>', content)
+    new_content = item_pat.sub(r'\g<1>' + new_name + r'\g<2>', new_content)
+
     if new_content != content:
         playbook_path.write_text(new_content)
         return True
