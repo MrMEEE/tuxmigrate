@@ -563,9 +563,9 @@ def _update_src_references(playbook_path: Path, old_name: str, new_name: str) ->
         else:
             # old_name is a plain loop item — check for src+dest {{ item }} conflict.
             item_in_src  = bool(re.search(
-                r'^\s+src:\s+["\']?.*\{\{\s*item\s*\}\}', part, re.MULTILINE))
+                r'^\s+src:\s+["\']?.*\{\{\s*item(?:\.src)?\s*\}\}', part, re.MULTILINE))
             item_in_dest = bool(re.search(
-                r'^\s+' + _DEST + r':\s+["\']?.*\{\{\s*item\s*\}\}', part, re.MULTILINE))
+                r'^\s+' + _DEST + r':\s+["\']?.*\{\{\s*item(?:\.dest)?\s*\}\}', part, re.MULTILINE))
 
             if item_in_src and item_in_dest:
                 # Conflict: promote loop item to {src:, dest:} dict.
